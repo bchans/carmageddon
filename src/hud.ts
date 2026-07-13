@@ -1,8 +1,6 @@
 import { RoadKind } from "./roads";
 import { ROAD_COST, type Economy, type UpgradeKey } from "./economy";
 
-export type GamePhase = "build" | "drive";
-
 const ROAD_LABELS: Record<RoadKind, string> = {
   [RoadKind.Standard]: "Road",
   [RoadKind.Mud]: "Mud (cheap, slow)",
@@ -21,18 +19,15 @@ const UPGRADE_LABELS: Record<UpgradeKey, string> = {
 export interface HudCallbacks {
   onSelectRoad: (kind: RoadKind) => void;
   onBuyUpgrade: (key: UpgradeKey) => void;
-  onStartDrive: () => void;
 }
 
 export class Hud {
   private root: HTMLDivElement;
   private currencyEl: HTMLDivElement;
-  private phaseEl: HTMLDivElement;
+  private statusEl: HTMLDivElement;
   private messageEl: HTMLDivElement;
   private roadButtons = new Map<RoadKind, HTMLButtonElement>();
   private upgradeButtons = new Map<UpgradeKey, HTMLButtonElement>();
-  private startDriveBtn: HTMLButtonElement;
-  private buildPanel: HTMLDivElement;
   private messageTimer: number | undefined;
 
   constructor(mount: HTMLElement, callbacks: HudCallbacks) {
@@ -43,18 +38,18 @@ export class Hud {
     topBar.className = "hud-topbar";
     this.currencyEl = document.createElement("div");
     this.currencyEl.className = "hud-currency";
-    this.phaseEl = document.createElement("div");
-    this.phaseEl.className = "hud-phase";
+    this.statusEl = document.createElement("div");
+    this.statusEl.className = "hud-phase";
     topBar.appendChild(this.currencyEl);
-    topBar.appendChild(this.phaseEl);
+    topBar.appendChild(this.statusEl);
     this.root.appendChild(topBar);
 
     this.messageEl = document.createElement("div");
     this.messageEl.className = "hud-message";
     this.root.appendChild(this.messageEl);
 
-    this.buildPanel = document.createElement("div");
-    this.buildPanel.className = "hud-build-panel";
+    const buildPanel = document.createElement("div");
+    buildPanel.className = "hud-build-panel";
 
     const roadRow = document.createElement("div");
     roadRow.className = "hud-row";
@@ -65,7 +60,7 @@ export class Hud {
       roadRow.appendChild(btn);
       this.roadButtons.set(kind, btn);
     }
-    this.buildPanel.appendChild(roadRow);
+    buildPanel.appendChild(roadRow);
 
     const upgradeRow = document.createElement("div");
     upgradeRow.className = "hud-row";
@@ -76,22 +71,14 @@ export class Hud {
       upgradeRow.appendChild(btn);
       this.upgradeButtons.set(key, btn);
     }
-    this.buildPanel.appendChild(upgradeRow);
+    buildPanel.appendChild(upgradeRow);
 
-    this.startDriveBtn = document.createElement("button");
-    this.startDriveBtn.className = "hud-btn hud-btn-primary";
-    this.startDriveBtn.textContent = "Start driving →";
-    this.startDriveBtn.addEventListener("click", () => callbacks.onStartDrive());
-    this.buildPanel.appendChild(this.startDriveBtn);
-
-    this.root.appendChild(this.buildPanel);
+    this.root.appendChild(buildPanel);
     mount.appendChild(this.root);
   }
 
-  setPhase(phase: GamePhase): void {
-    this.phaseEl.textContent =
-      phase === "build" ? "BUILD: place roads, then drive" : "DRIVE: reach the toll marker";
-    this.buildPanel.style.display = phase === "build" ? "flex" : "none";
+  setStatus(text: string): void {
+    this.statusEl.textContent = text;
   }
 
   setSelectedRoad(kind: RoadKind | null): void {

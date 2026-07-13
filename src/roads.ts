@@ -197,24 +197,23 @@ export class RoadSystem {
     tile.group.position.copy(center);
     this.root.add(tile.group);
 
-    const bodyDesc = this.RAPIER.RigidBodyDesc.fixed().setTranslation(center.x, center.y + SLAB_THICKNESS / 2, center.z);
-    const body = this.world.createRigidBody(bodyDesc);
-    let colliderDesc: RAPIER.ColliderDesc;
+    // Only ramps get their own physics collider (a tilted launch surface) — every
+    // other tile kind is visual + curbs only, relying on the terrain heightfield
+    // (already smooth) for support. Independent flat slabs per tile would otherwise
+    // create physical steps between neighbors wherever the terrain has any slope.
     if (kind === RoadKind.Ramp) {
+      const bodyDesc = this.RAPIER.RigidBodyDesc.fixed().setTranslation(center.x, center.y + SLAB_THICKNESS / 2, center.z);
       const angle = -0.42; // radians, ramps upward towards the facing direction
-      colliderDesc = this.RAPIER.ColliderDesc.cuboid(TILE_SIZE / 2, SLAB_THICKNESS / 2, TILE_SIZE * 0.75).setFriction(1.1);
       const rotAxis = facing % 2 === 0 ? { x: 1, y: 0, z: 0 } : { x: 0, y: 0, z: 1 };
       const sign = facing === 0 || facing === 3 ? 1 : -1;
-      const half = angle * sign;
-      const s = Math.sin(half / 2);
-      const c = Math.cos(half / 2);
+      const half = (angle * sign) / 2;
+      const s = Math.sin(half);
+      const c = Math.cos(half);
       bodyDesc.setRotation({ x: rotAxis.x * s, y: rotAxis.y * s, z: rotAxis.z * s, w: c });
-    } else {
-      colliderDesc = this.RAPIER.ColliderDesc.cuboid(TILE_SIZE / 2, SLAB_THICKNESS / 2, TILE_SIZE / 2).setFriction(
-        kind === RoadKind.Mud ? 0.5 : 1.2,
-      );
+      const body = this.world.createRigidBody(bodyDesc);
+      const colliderDesc = this.RAPIER.ColliderDesc.cuboid(TILE_SIZE / 2, SLAB_THICKNESS / 2, TILE_SIZE * 0.75).setFriction(1.1);
+      this.world.createCollider(colliderDesc, body);
     }
-    this.world.createCollider(colliderDesc, body);
     this.tiles.set(cellKey(cell), tile);
 
     // Recompute curbs for this tile and every orthogonal neighbor tile.
@@ -229,6 +228,86 @@ export class RoadSystem {
     const tile = this.tiles.get(cellKey(cell));
     if (!tile) return;
     tile.updateConnections(this.connectionMask(cell));
+  }
+
+  /**
+   * Dijkstra shortest path (weighted by tile speed, so faster tiles like
+   * boost strips are preferred) from the spawn cell to the target cell.
+   * Returns the ordered cell path, or null if no route exists yet.
+   */
+  findPath(): Cell[] | null {
+    const startKey = cellKey(this.spawnCell);
+    const goalKey = cellKey(this.targetCell);
+    const dist = new Map<string, number>([[startKey, 0]]);
+    const prev = new Map<string, Cell>();
+    const visited = new Set<string>();
+    const frontier: string[] = [startKey];
+
+    while (frontier.length > 0) {
+      let bestIdx = 0;
+      for (let i = 1; i < frontier.length; i++) {
+        if ((dist.get(frontier[i]) ?? Infinity) < (dist.get(frontier[bestIdx]) ?? Infinity)) bestIdx = i;
+      }
+      const currentKey = frontier.splice(bestIdx, 1)[0];
+      if (visited.has(currentKey)) continue;
+      visited.add(currentKey);
+      if (currentKey === goalKey) break;
+
+      const [col, row] = currentKey.split(":").map(Number);
+      const current: Cell = { col, row };
+      for (const edge of this.edgesFrom(current)) {
+        const edgeKey = cellKey(edge.cell);
+        if (visited.has(edgeKey)) continue;
+        const nd = (dist.get(currentKey) ?? Infinity) + edge.weight;
+        if (nd < (dist.get(edgeKey) ?? Infinity)) {
+          dist.set(edgeKey, nd);
+          prev.set(edgeKey, current);
+          frontier.push(edgeKey);
+        }
+      }
+    }
+
+    if (!dist.has(goalKey)) return null;
+    const path: Cell[] = [this.targetCell];
+    let currentKey = goalKey;
+    while (currentKey !== startKey) {
+      const p = prev.get(currentKey);
+      if (!p) return null;
+      path.push(p);
+      currentKey = cellKey(p);
+    }
+    path.reverse();
+    return path;
+  }
+
+  /** Orthogonal neighbors plus ramp shortcut edges (a ramp jumps 2 tiles). */
+  private edgesFrom(cell: Cell): Array<{ cell: Cell; weight: number }> {
+    const edges: Array<{ cell: Cell; weight: number }> = [];
+    for (const { dc, dr } of DIRS) {
+      const neighbor = { col: cell.col + dc, row: cell.row + dr };
+      if (!this.isNetworkCell(neighbor)) continue;
+      const kind = this.tiles.get(cellKey(neighbor))?.kind;
+      const speed = kind ? SPEED_MULTIPLIER[kind] : 1;
+      edges.push({ cell: neighbor, weight: TILE_SIZE / speed });
+    }
+    const tile = this.tiles.get(cellKey(cell));
+    if (tile?.kind === RoadKind.Ramp) {
+      const { dc, dr } = DIRS[tile.facing];
+      const landing = { col: cell.col + dc * 2, row: cell.row + dr * 2 };
+      if (this.isNetworkCell(landing)) {
+        edges.push({ cell: landing, weight: TILE_SIZE * 1.5 });
+      }
+    }
+    return edges;
+  }
+
+  /** Converts a cell path into world-space waypoints, using exact spawn/target positions at the ends. */
+  buildWaypoints(path: Cell[], spawnWorld: THREE.Vector3, targetWorld: THREE.Vector3): THREE.Vector3[] {
+    return path.map((cell, i) => {
+      if (i === 0) return spawnWorld.clone();
+      if (i === path.length - 1) return targetWorld.clone();
+      return this.cellWorldCenter(cell);
+    });
   }
 
   getKindAt(x: number, z: number): RoadKind | null {

@@ -5,12 +5,16 @@ import { Terrain } from "./terrain";
 import { Car } from "./car";
 import { RoadSystem, RoadKind, TILE_SIZE, SPEED_MULTIPLIER } from "./roads";
 import { Economy, ROAD_COST, TOLL_REWARD } from "./economy";
-import { InputController } from "./input";
-import { Hud, type GamePhase } from "./hud";
+import { CameraController } from "./input";
+import { Autopilot } from "./autopilot";
+import { Hud } from "./hud";
 
 const FIXED_DT = 1 / 60;
 const TARGET_REACHED_RADIUS = TILE_SIZE * 1.1;
 const SPAWN_MARGIN = 14;
+
+const CAMERA_BASE_HEIGHT = 70;
+const CAMERA_BASE_BACK = 45;
 
 export class Game {
   private scene = new THREE.Scene();
@@ -25,10 +29,10 @@ export class Game {
   private car!: Car;
   private roads!: RoadSystem;
   private economy = new Economy();
-  private input!: InputController;
+  private cameraController!: CameraController;
+  private autopilot = new Autopilot();
   private hud!: Hud;
 
-  private phase: GamePhase = "build";
   private selectedRoadKind: RoadKind = RoadKind.Standard;
   private spawnWorld = new THREE.Vector3();
   private targetWorld = new THREE.Vector3();
@@ -36,15 +40,12 @@ export class Game {
   private hoverMarker!: THREE.Mesh;
   private rng: () => number;
   private levelSeed = 1;
-
-  private cameraPitch = 0.32;
-  private cameraDistance = 9;
   private container: HTMLElement;
 
   constructor(container: HTMLElement) {
     this.container = container;
     this.rng = mulberry32(Date.now() & 0xffffffff);
-    this.camera = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 0.1, 500);
+    this.camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, 500);
     this.renderer = new THREE.WebGLRenderer({ antialias: true });
     this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     this.renderer.shadowMap.enabled = true;
@@ -79,7 +80,11 @@ export class Game {
     this.scene.add(this.hoverMarker);
     this.updateTargetMarker();
 
-    this.input = new InputController(this.container);
+    this.cameraController = new CameraController(this.renderer.domElement, {
+      onTap: (x, y) => this.onTap(x, y),
+      onHover: (x, y) => this.onHover(x, y),
+    });
+
     this.hud = new Hud(this.container, {
       onSelectRoad: (kind) => {
         this.selectedRoadKind = kind;
@@ -91,16 +96,12 @@ export class Game {
           this.hud.update(this.economy);
         }
       },
-      onStartDrive: () => this.setPhase("drive"),
     });
     this.hud.setSelectedRoad(this.selectedRoadKind);
-    this.setPhase("build");
     this.hud.update(this.economy);
+    this.refreshPath();
 
-    this.renderer.domElement.addEventListener("pointerdown", this.onPointerDown);
-    this.renderer.domElement.addEventListener("pointermove", this.onPointerMove);
     this.onResize();
-
     this.renderer.setAnimationLoop(this.loop);
   }
 
@@ -139,24 +140,25 @@ export class Game {
     return p;
   }
 
-  private setPhase(phase: GamePhase): void {
-    this.phase = phase;
-    this.hud.setPhase(phase);
-    if (phase === "drive") {
-      const spawn = this.spawnWorld.clone();
-      spawn.y += 1;
-      this.car.respawn(spawn);
-    }
-  }
-
   private updateTargetMarker(): void {
     this.targetMarker.position.copy(this.targetWorld);
     this.targetMarker.position.y += 2.2;
   }
 
-  private onPointerDown = (event: PointerEvent): void => {
-    if (this.phase !== "build") return;
-    const cell = this.raycastCell(event);
+  /** Recomputes the road network path and hands it to the autopilot. */
+  private refreshPath(): void {
+    const path = this.roads.findPath();
+    if (path) {
+      this.autopilot.setPath(this.roads.buildWaypoints(path, this.spawnWorld, this.targetWorld));
+      this.hud.setStatus("Driving to the toll marker");
+    } else {
+      this.autopilot.clearPath();
+      this.hud.setStatus("No route yet — build a road to continue");
+    }
+  }
+
+  private onTap(clientX: number, clientY: number): void {
+    const cell = this.raycastCell(clientX, clientY);
     if (!cell) return;
     if (!this.roads.canPlace(cell)) {
       this.hud.showMessage("Can't place there — must connect to your road network.");
@@ -170,14 +172,11 @@ export class Game {
     this.economy.spend(cost);
     this.roads.place(cell, this.selectedRoadKind);
     this.hud.update(this.economy);
-  };
+    this.refreshPath();
+  }
 
-  private onPointerMove = (event: PointerEvent): void => {
-    if (this.phase !== "build") {
-      this.hoverMarker.visible = false;
-      return;
-    }
-    const cell = this.raycastCell(event);
+  private onHover(clientX: number, clientY: number): void {
+    const cell = this.raycastCell(clientX, clientY);
     if (!cell) {
       this.hoverMarker.visible = false;
       return;
@@ -187,14 +186,14 @@ export class Game {
     this.hoverMarker.visible = true;
     const ok = this.roads.canPlace(cell);
     (this.hoverMarker.material as THREE.MeshBasicMaterial).color.set(ok ? 0x4ade80 : 0xef4444);
-  };
+  }
 
   private raycaster = new THREE.Raycaster();
-  private raycastCell(event: PointerEvent): { col: number; row: number } | null {
+  private raycastCell(clientX: number, clientY: number): { col: number; row: number } | null {
     const rect = this.renderer.domElement.getBoundingClientRect();
     const ndc = new THREE.Vector2(
-      ((event.clientX - rect.left) / rect.width) * 2 - 1,
-      -((event.clientY - rect.top) / rect.height) * 2 + 1,
+      ((clientX - rect.left) / rect.width) * 2 - 1,
+      -((clientY - rect.top) / rect.height) * 2 + 1,
     );
     this.raycaster.setFromCamera(ndc, this.camera);
     const hit = this.raycaster.intersectObject(this.terrain.mesh, false)[0];
@@ -215,28 +214,25 @@ export class Game {
       this.stepPhysics(FIXED_DT);
       this.accumulator -= FIXED_DT;
     }
-    this.updateCamera(dt);
+    this.updateCamera();
     this.renderer.render(this.scene, this.camera);
   };
 
   private stepPhysics(dt: number): void {
-    if (this.phase === "drive") {
-      const p = this.car.position;
-      const onRoad = this.roads.getKindAt(p.x, p.z);
-      if (onRoad) {
-        this.car.speedZoneMultiplier = SPEED_MULTIPLIER[onRoad];
-      } else if (this.terrain.isUnderwaterAt(p.x, p.z)) {
-        this.car.speedZoneMultiplier = 0.12;
-      } else {
-        this.car.speedZoneMultiplier = 1;
-      }
-      this.car.update(dt, this.input.getCarInput());
+    const p = this.car.position;
+    const onRoad = this.roads.getKindAt(p.x, p.z);
+    if (onRoad) {
+      this.car.speedZoneMultiplier = SPEED_MULTIPLIER[onRoad];
+    } else if (this.terrain.isUnderwaterAt(p.x, p.z)) {
+      this.car.speedZoneMultiplier = 0.12;
     } else {
       this.car.speedZoneMultiplier = 1;
     }
+    const input = this.autopilot.computeInput(p, this.car.mesh.quaternion);
+    this.car.update(dt, input);
     this.world.step();
 
-    if (this.phase === "drive" && this.car.position.distanceTo(this.targetWorld) < TARGET_REACHED_RADIUS) {
+    if (this.car.position.distanceTo(this.targetWorld) < TARGET_REACHED_RADIUS) {
       this.onTollReached();
     }
     if (this.car.position.y < -20) {
@@ -252,20 +248,16 @@ export class Game {
     this.roads.setEndpoints(this.spawnWorld, this.targetWorld);
     this.updateTargetMarker();
     this.hud.update(this.economy);
-    this.setPhase("build");
+    this.car.respawn(this.spawnWorld.clone().setY(this.spawnWorld.y + 1));
+    this.refreshPath();
   }
 
-  private updateCamera(dt: number): void {
-    const carPos = this.car.position;
-    const carQuat = this.car.mesh.quaternion;
-    const back = new THREE.Vector3(0, 0, 1).applyQuaternion(carQuat);
-    const desired = carPos
-      .clone()
-      .add(back.multiplyScalar(this.cameraDistance))
-      .add(new THREE.Vector3(0, this.cameraDistance * this.cameraPitch, 0));
-    this.camera.position.lerp(desired, Math.min(1, dt * 4));
-    const lookTarget = carPos.clone().add(new THREE.Vector3(0, 1, 0));
-    this.camera.lookAt(lookTarget);
+  private updateCamera(): void {
+    this.cameraController.clampPan(this.terrain.worldSize / 2 - 10);
+    const center = new THREE.Vector3(this.cameraController.panOffset.x, 0, this.cameraController.panOffset.y);
+    const zoom = this.cameraController.zoom;
+    this.camera.position.set(center.x, CAMERA_BASE_HEIGHT / zoom, center.z + CAMERA_BASE_BACK / zoom);
+    this.camera.lookAt(center);
   }
 }
 

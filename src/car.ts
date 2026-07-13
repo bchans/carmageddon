@@ -22,7 +22,7 @@ export const BASE_CAR_STATS: CarStats = {
   engineForce: 55,
   brakeForce: 18,
   suspensionStiffness: 24,
-  frictionSlip: 3.2,
+  frictionSlip: 4.2,
   boostForce: 45,
   boostCapacity: 3,
 };
@@ -31,16 +31,21 @@ const CHASSIS_HALF_EXTENTS = { x: 0.85, y: 0.32, z: 1.85 };
 const WHEEL_RADIUS = 0.42;
 const WHEEL_HALF_TRACK = 0.82;
 const SUSPENSION_REST = 0.35;
-const MAX_STEER = 0.55; // radians
+export const MAX_STEER = 0.7; // radians
+export const WHEELBASE = 2.5; // distance between front and rear axles (matches WHEEL_LOCAL_POSITIONS z spacing)
+const MAX_SPEED = 11; // m/s cruising speed cap, used for grounded kinematic driving
+const MAX_YAW_RATE = 1.8; // radians/sec, at full steer input
 
+// Forward is local -Z (verified empirically), so the steered "front" wheels
+// must sit at negative z — the leading edge in the direction of travel.
 const WHEEL_LOCAL_POSITIONS: Array<{ x: number; z: number }> = [
-  { x: -WHEEL_HALF_TRACK, z: 1.25 }, // front-left
-  { x: WHEEL_HALF_TRACK, z: 1.25 }, // front-right
-  { x: -WHEEL_HALF_TRACK, z: -1.25 }, // rear-left
-  { x: WHEEL_HALF_TRACK, z: -1.25 }, // rear-right
+  { x: -WHEEL_HALF_TRACK, z: -1.25 }, // front-left
+  { x: WHEEL_HALF_TRACK, z: -1.25 }, // front-right
+  { x: -WHEEL_HALF_TRACK, z: 1.25 }, // rear-left
+  { x: WHEEL_HALF_TRACK, z: 1.25 }, // rear-right
 ];
 const FRONT_WHEELS = [0, 1];
-const DRIVE_WHEELS = [0, 1, 2, 3]; // all-wheel drive for arcade off-road feel
+const DRIVE_WHEELS = [2, 3]; // rear-wheel drive: keeps steered front wheels free to turn cleanly
 
 export class Car {
   readonly chassisBody: RAPIER.RigidBody;
@@ -90,7 +95,7 @@ export class Car {
       this.controller.setWheelSuspensionRelaxation(i, 0.88);
       this.controller.setWheelMaxSuspensionTravel(i, 0.35);
       this.controller.setWheelFrictionSlip(i, this.stats.frictionSlip);
-      this.controller.setWheelSideFrictionStiffness(i, 1.0);
+      this.controller.setWheelSideFrictionStiffness(i, 4.5);
     }
 
     this.mesh = buildCarMesh();
@@ -149,6 +154,47 @@ export class Car {
     }
 
     this.controller.updateVehicle(dt);
+
+    // Tire-friction alone struggles to reliably close a heading error at low
+    // speed for an AI-driven car (it wide-arcs/orbits instead of turning
+    // cleanly onto a waypoint). While grounded, nudge velocity and yaw rate
+    // directly towards what the steering input implies; while airborne (e.g.
+    // off a ramp) leave physics alone so jumps still arc and land naturally.
+    const grounded = [0, 1, 2, 3].some((i) => this.controller.wheelIsInContact(i));
+    if (grounded) {
+      // Directly rotating the chassis (rather than nudging angular velocity)
+      // sidesteps friction-based counter-torque from the chassis/wheel
+      // contacts fighting the turn — setAngvel alone kept getting damped
+      // back towards zero by world.step()'s contact resolution.
+      // A positive rotation about world +Y turns local forward (0,0,-1)
+      // towards -X, so a positive steer (target to the right, +X) needs a
+      // *negative* yaw delta here.
+      const yawDelta = -input.steer * MAX_YAW_RATE * dt;
+      const r = this.chassisBody.rotation();
+      const currentQuat = new THREE.Quaternion(r.x, r.y, r.z, r.w);
+      const deltaQuat = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), yawDelta);
+      const newQuat = deltaQuat.multiply(currentQuat).normalize();
+      this.chassisBody.setRotation({ x: newQuat.x, y: newQuat.y, z: newQuat.z, w: newQuat.w }, true);
+      // Clear leftover tire-friction angular momentum so world.step() doesn't
+      // additionally integrate rotation on top of the direct set above.
+      const residualAngvel = this.chassisBody.angvel();
+      this.chassisBody.setAngvel({ x: residualAngvel.x, y: 0, z: residualAngvel.z }, true);
+
+      const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(newQuat);
+      const desiredSpeed = input.throttle * MAX_SPEED * forceMultiplier;
+      const desired = forward.multiplyScalar(desiredSpeed);
+      const vel = this.chassisBody.linvel();
+      const velBlend = Math.min(1, dt * 3.5);
+      this.chassisBody.setLinvel(
+        {
+          x: THREE.MathUtils.lerp(vel.x, desired.x, velBlend),
+          y: vel.y,
+          z: THREE.MathUtils.lerp(vel.z, desired.z, velBlend),
+        },
+        true,
+      );
+    }
+
     this.syncMesh();
   }
 
