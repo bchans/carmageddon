@@ -11,8 +11,14 @@ import { Hud } from "./hud";
 
 const FIXED_DT = 1 / 60;
 const TARGET_REACHED_RADIUS = TILE_SIZE * 1.1;
-const SPAWN_MARGIN = 14;
+const SPAWN_MARGIN = 10;
 const BUILD_TIME = 24; // seconds of build time before the car departs each round
+
+// The very first target sits close to spawn (cheap, quick win); each round
+// after that pushes the next target progressively farther out, so difficulty
+// ramps instead of demanding a full map-width connection from round one.
+const MIN_TARGET_DIST = 16;
+const RAMP_ROUNDS = 6;
 
 const CAMERA_BASE_HEIGHT = 70;
 const CAMERA_BASE_BACK = 45;
@@ -41,12 +47,12 @@ export class Game {
   private targetMarker!: THREE.Object3D;
   private hoverMarker!: THREE.Mesh;
   private rng: () => number;
-  private levelSeed = 1;
   private container: HTMLElement;
 
   private carActive = false;
   private buildTimer = BUILD_TIME;
   private lastCountdownSecond = -1;
+  private roundNumber = 0;
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -65,14 +71,14 @@ export class Game {
     this.world.timestep = FIXED_DT;
 
     this.setupLights();
-    this.terrain = Terrain.generate(this.RAPIER, this.world, this.levelSeed);
+    this.terrain = Terrain.generate(this.RAPIER, this.world, 1);
     this.scene.add(this.terrain.mesh, this.terrain.waterMesh);
 
     this.roads = new RoadSystem(this.RAPIER, this.world, this.terrain);
     this.scene.add(this.roads.root);
 
     this.spawnWorld = this.pickEdgePoint(-1);
-    this.targetWorld = this.pickEdgePoint(1);
+    this.targetWorld = this.pickTargetPoint();
     this.roads.setEndpoints(this.spawnWorld, this.targetWorld);
 
     const initialSpawn = this.spawnWorld.clone();
@@ -150,6 +156,31 @@ export class Game {
     const p = new THREE.Vector3(x, 0, 0);
     p.y = this.terrain.getHeightAt(x, 0);
     return p;
+  }
+
+  /**
+   * Picks a valid target at a distance from spawn that grows with the round
+   * number — round 0 is a short, cheap first connection; later rounds push
+   * further out towards the map edge.
+   */
+  private pickTargetPoint(): THREE.Vector3 {
+    const half = this.terrain.worldSize / 2 - SPAWN_MARGIN;
+    const maxDist = this.terrain.worldSize * 0.8;
+    const targetDist = THREE.MathUtils.lerp(MIN_TARGET_DIST, maxDist, Math.min(1, this.roundNumber / RAMP_ROUNDS));
+
+    for (let attempt = 0; attempt < 80; attempt++) {
+      const angle = this.rng() * Math.PI * 2;
+      const dist = targetDist * (0.75 + this.rng() * 0.25);
+      const x = THREE.MathUtils.clamp(this.spawnWorld.x + Math.cos(angle) * dist, -half, half);
+      const z = THREE.MathUtils.clamp(this.spawnWorld.z + Math.sin(angle) * dist, -half, half);
+      if (Math.hypot(x - this.spawnWorld.x, z - this.spawnWorld.z) < MIN_TARGET_DIST * 0.6) continue;
+      if (this.terrain.isUnderwaterAt(x, z)) continue;
+      if (this.terrain.getSlopeAt(x, z) > 0.9) continue;
+      const p = new THREE.Vector3(x, 0, z);
+      p.y = this.terrain.getHeightAt(x, z);
+      return p;
+    }
+    return this.pickEdgePoint(1);
   }
 
   private updateTargetMarker(): void {
@@ -279,8 +310,8 @@ export class Game {
   private onTollReached(): void {
     this.economy.addToll();
     this.hud.showMessage(`Toll paid! +${TOLL_REWARD} — build the next road.`);
-    this.levelSeed += 1;
-    this.targetWorld = this.pickEdgePoint(1);
+    this.roundNumber += 1;
+    this.targetWorld = this.pickTargetPoint();
     this.roads.setEndpoints(this.spawnWorld, this.targetWorld);
     this.updateTargetMarker();
     this.hud.update(this.economy);

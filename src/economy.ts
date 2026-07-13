@@ -1,15 +1,15 @@
 import { BASE_CAR_STATS, type CarStats } from "./car";
 import { RoadKind } from "./roads";
 
-export const STARTING_CURRENCY = 30;
+export const STARTING_CURRENCY = 40;
 export const TOLL_REWARD = 28;
 
 export const ROAD_COST: Record<RoadKind, number> = {
-  [RoadKind.Standard]: 8,
-  [RoadKind.Mud]: 3,
-  [RoadKind.Boost]: 18,
-  [RoadKind.Crossroad]: 22,
-  [RoadKind.Ramp]: 16,
+  [RoadKind.Standard]: 6,
+  [RoadKind.Mud]: 2,
+  [RoadKind.Boost]: 14,
+  [RoadKind.Crossroad]: 18,
+  [RoadKind.Ramp]: 12,
 };
 
 export type UpgradeKey = "engine" | "suspension" | "grip" | "boost";

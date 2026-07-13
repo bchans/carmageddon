@@ -4,8 +4,8 @@ import type RAPIER from "@dimforge/rapier3d-compat";
 import type { Rapier } from "./physics";
 
 /** Square terrain: world spans [-size/2, size/2] on both X and Z. */
-export const TERRAIN_SIZE = 240;
-export const TERRAIN_SEGMENTS = 120; // vertices per side = SEGMENTS + 1
+export const TERRAIN_SIZE = 120;
+export const TERRAIN_SEGMENTS = 60; // vertices per side = SEGMENTS + 1
 const GRID = TERRAIN_SEGMENTS + 1;
 const SPACING = TERRAIN_SIZE / TERRAIN_SEGMENTS;
 
@@ -56,7 +56,7 @@ export class Terrain {
     const heights = new Float32Array(GRID * GRID);
 
     // Base heightmap: fractal Brownian motion (layered noise).
-    const baseFreq = 1 / 90;
+    const baseFreq = 1 / 45; // rescaled with TERRAIN_SIZE so the map keeps similar relative ruggedness
     const octaves = 5;
     for (let iy = 0; iy < GRID; iy++) {
       for (let ix = 0; ix < GRID; ix++) {
@@ -243,41 +243,55 @@ function smooth(heights: Float32Array, passes: number): void {
   }
 }
 
-function buildMesh(heights: Float32Array, isRiver: Uint8Array): THREE.Mesh {
-  const geometry = new THREE.PlaneGeometry(
-    TERRAIN_SIZE,
-    TERRAIN_SIZE,
-    TERRAIN_SEGMENTS,
-    TERRAIN_SEGMENTS,
-  );
-  geometry.rotateX(-Math.PI / 2);
+const ROCK = new THREE.Color(0x8a7a63);
+const GRASS_LOW = new THREE.Color(0x6ab04c);
+const GRASS_HIGH = new THREE.Color(0x4c8a3a);
+const SAND = new THREE.Color(0xe0c383);
+const RIVERBED = new THREE.Color(0x7a5f3d);
 
+function colorForHeight(h: number, isRiver: boolean): THREE.Color {
+  if (isRiver) return RIVERBED;
+  if (h < WATER_LEVEL + 0.6) return SAND;
+  if (h < 3.5) return GRASS_LOW;
+  if (h < 6) return GRASS_HIGH;
+  const t = THREE.MathUtils.clamp((h - 6) / 8, 0, 1);
+  return GRASS_HIGH.clone().lerp(ROCK, t);
+}
+
+function worldToGrid(x: number, z: number): { ix: number; iy: number } {
+  const ix = THREE.MathUtils.clamp(Math.round((x + TERRAIN_SIZE / 2) / SPACING), 0, GRID - 1);
+  const iy = THREE.MathUtils.clamp(Math.round((z + TERRAIN_SIZE / 2) / SPACING), 0, GRID - 1);
+  return { ix, iy };
+}
+
+function buildMesh(heights: Float32Array, isRiver: Uint8Array): THREE.Mesh {
+  const indexed = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, TERRAIN_SEGMENTS, TERRAIN_SEGMENTS);
+  indexed.rotateX(-Math.PI / 2);
+  const indexedPos = indexed.attributes.position as THREE.BufferAttribute;
+  for (let i = 0; i < indexedPos.count; i++) indexedPos.setY(i, heights[i]);
+
+  // Convert to non-indexed and flat-color each triangle uniformly (rather than
+  // interpolating vertex colors) for a crisp low-poly faceted look instead of
+  // a smoothly blended gradient.
+  const geometry = indexed.toNonIndexed();
   const position = geometry.attributes.position as THREE.BufferAttribute;
   const colors = new Float32Array(position.count * 3);
 
-  const rock = new THREE.Color(0x7d7364);
-  const grass = new THREE.Color(0x5a8f4a);
-  const sand = new THREE.Color(0xcdb583);
-  const riverbed = new THREE.Color(0x6b5a3e);
-
-  for (let i = 0; i < position.count; i++) {
-    const h = heights[i];
-    position.setY(i, h);
-
-    const c = new THREE.Color();
-    if (isRiver[i]) {
-      c.copy(riverbed);
-    } else if (h < WATER_LEVEL + 0.6) {
-      c.copy(sand);
-    } else if (h < 6) {
-      c.copy(grass);
-    } else {
-      const t = THREE.MathUtils.clamp((h - 6) / 8, 0, 1);
-      c.copy(grass).lerp(rock, t);
+  for (let tri = 0; tri < position.count; tri += 3) {
+    let hSum = 0;
+    let riverAny = false;
+    for (let k = 0; k < 3; k++) {
+      const { ix, iy } = worldToGrid(position.getX(tri + k), position.getZ(tri + k));
+      const i = idx(iy, ix);
+      hSum += heights[i];
+      if (isRiver[i]) riverAny = true;
     }
-    colors[i * 3] = c.r;
-    colors[i * 3 + 1] = c.g;
-    colors[i * 3 + 2] = c.b;
+    const c = colorForHeight(hSum / 3, riverAny);
+    for (let k = 0; k < 3; k++) {
+      colors[(tri + k) * 3] = c.r;
+      colors[(tri + k) * 3 + 1] = c.g;
+      colors[(tri + k) * 3 + 2] = c.b;
+    }
   }
 
   geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3));
@@ -285,7 +299,8 @@ function buildMesh(heights: Float32Array, isRiver: Uint8Array): THREE.Mesh {
 
   const material = new THREE.MeshStandardMaterial({
     vertexColors: true,
-    roughness: 0.95,
+    flatShading: true,
+    roughness: 0.9,
     metalness: 0,
   });
 
