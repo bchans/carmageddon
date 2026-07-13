@@ -2,11 +2,14 @@ import * as THREE from "three";
 import type RAPIER from "@dimforge/rapier3d-compat";
 import type { Rapier } from "./physics";
 import type { Terrain } from "./terrain";
+import type { RoadAssets } from "./assets";
 
 export const TILE_SIZE = 4;
 const CURB_HEIGHT = 0.6;
 const CURB_THICKNESS = 0.25;
-const SLAB_THICKNESS = 0.16;
+// Kenney's road tiles are a 1x1 native footprint, ~0.02 units thick; scaled by
+// TILE_SIZE that's the height of the road surface above the terrain.
+const SLAB_THICKNESS = 0.02 * TILE_SIZE;
 
 export const RoadKind = {
   Standard: "standard",
@@ -46,26 +49,38 @@ class RoadTile {
   readonly kind: RoadKind;
   readonly group = new THREE.Group();
   private curbBodies: RAPIER.RigidBody[] = [];
+  private curbMeshes: THREE.Object3D[] = [];
   private readonly world: RAPIER.World;
   private readonly RAPIER: Rapier;
   private readonly centerHeight: number;
   /** For ramps: the direction (index into DIRS) the ramp launches towards. */
   readonly facing: number;
 
-  constructor(RAPIER: Rapier, world: RAPIER.World, cell: Cell, kind: RoadKind, centerHeight: number, facing: number) {
+  constructor(
+    RAPIER: Rapier,
+    world: RAPIER.World,
+    cell: Cell,
+    kind: RoadKind,
+    centerHeight: number,
+    facing: number,
+    roadAssets: RoadAssets,
+    terrainPitch: number,
+  ) {
     this.RAPIER = RAPIER;
     this.world = world;
     this.cell = cell;
     this.kind = kind;
     this.centerHeight = centerHeight;
     this.facing = facing;
-    this.group.add(buildSlabMesh(kind));
+    this.group.add(buildTileMesh(kind, facing, roadAssets, terrainPitch));
   }
 
   /** Rebuild the perpendicular curb walls based on which neighbor sides are open. */
   updateConnections(connectedMask: boolean[]): void {
     for (const body of this.curbBodies) this.world.removeRigidBody(body);
     this.curbBodies = [];
+    for (const mesh of this.curbMeshes) this.group.remove(mesh);
+    this.curbMeshes = [];
 
     if (this.kind === RoadKind.Crossroad) return; // always open in all directions
 
@@ -100,6 +115,7 @@ class RoadTile {
     mesh.position.set(x - center.x, CURB_HEIGHT / 2 + SLAB_THICKNESS, z - center.z);
     mesh.castShadow = true;
     this.group.add(mesh);
+    this.curbMeshes.push(mesh);
   }
 }
 
@@ -107,19 +123,64 @@ function cellCenter(cell: Cell): THREE.Vector3 {
   return new THREE.Vector3(cell.col * TILE_SIZE, 0, cell.row * TILE_SIZE);
 }
 
-function buildSlabMesh(kind: RoadKind): THREE.Mesh {
-  const colors: Record<RoadKind, number> = {
-    [RoadKind.Standard]: 0x3a3a3f,
-    [RoadKind.Crossroad]: 0x45454b,
-    [RoadKind.Ramp]: 0x55503f,
-    [RoadKind.Boost]: 0xffa53d,
-    [RoadKind.Mud]: 0x5b4632,
-  };
-  const geo = new THREE.BoxGeometry(TILE_SIZE * 0.96, SLAB_THICKNESS, TILE_SIZE * 0.96);
-  const mat = new THREE.MeshStandardMaterial({ color: colors[kind], roughness: 0.85 });
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.position.y = SLAB_THICKNESS / 2;
-  mesh.receiveShadow = true;
+const MAX_TERRAIN_PITCH = 0.35; // radians (~20°) — beyond this, prefer a ramp instead
+
+/**
+ * Tilts a straight/mud/boost tile to match the terrain slope along its own
+ * travel axis, so it hugs rolling ground instead of floating above dips or
+ * having terrain poke through on the high side.
+ */
+function computeTerrainPitch(terrain: Terrain, cx: number, cz: number, facing: number): number {
+  const half = TILE_SIZE / 2;
+  const axisIsZ = facing % 2 === 0;
+  const lo = axisIsZ ? terrain.getHeightAt(cx, cz - half) : terrain.getHeightAt(cx - half, cz);
+  const hi = axisIsZ ? terrain.getHeightAt(cx, cz + half) : terrain.getHeightAt(cx + half, cz);
+  const pitch = Math.atan2(lo - hi, TILE_SIZE);
+  return Math.max(-MAX_TERRAIN_PITCH, Math.min(MAX_TERRAIN_PITCH, pitch));
+}
+
+// Tint colors for the gameplay-only tile kinds Kenney's kit has no dedicated
+// piece for — applied as a material color multiply over the road texture.
+const TILE_TINT: Partial<Record<RoadKind, number>> = {
+  [RoadKind.Boost]: 0xffa53d,
+  [RoadKind.Mud]: 0x6b5636,
+};
+
+/** Clones, scales, and orients the road piece template matching this tile's kind and facing. */
+function buildTileMesh(kind: RoadKind, facing: number, roadAssets: RoadAssets, terrainPitch: number): THREE.Object3D {
+  let template: THREE.Object3D;
+  let rotationY: number;
+  if (kind === RoadKind.Crossroad) {
+    template = roadAssets.crossroad;
+    rotationY = 0;
+  } else if (kind === RoadKind.Ramp) {
+    template = roadAssets.ramp;
+    rotationY = facing * (Math.PI / 2);
+  } else {
+    template = roadAssets.straight;
+    // facing 0/2 (N/S) run along world Z, facing 1/3 (E/W) run along world X.
+    rotationY = facing % 2 === 0 ? 0 : Math.PI / 2;
+  }
+
+  const mesh = template.clone(true);
+  mesh.scale.setScalar(TILE_SIZE);
+  // Pitch is applied before yaw (THREE's default XYZ Euler order), so it always
+  // tilts the tile's own travel axis to match terrain slope regardless of facing.
+  mesh.rotation.set(kind === RoadKind.Crossroad || kind === RoadKind.Ramp ? 0 : terrainPitch, rotationY, 0);
+
+  const tint = TILE_TINT[kind];
+  mesh.traverse((obj) => {
+    if (!(obj instanceof THREE.Mesh)) return;
+    obj.castShadow = true;
+    obj.receiveShadow = true;
+    if (tint !== undefined) {
+      const base = Array.isArray(obj.material) ? obj.material[0] : obj.material;
+      const cloned = (base as THREE.MeshStandardMaterial).clone();
+      cloned.color = new THREE.Color(tint);
+      obj.material = cloned;
+    }
+  });
+
   return mesh;
 }
 
@@ -129,13 +190,15 @@ export class RoadSystem {
   private readonly RAPIER: Rapier;
   private readonly world: RAPIER.World;
   private readonly terrain: Terrain;
+  private readonly roadAssets: RoadAssets;
   private spawnCell: Cell = { col: 0, row: 0 };
   private targetCell: Cell = { col: 0, row: 0 };
 
-  constructor(RAPIER: Rapier, world: RAPIER.World, terrain: Terrain) {
+  constructor(RAPIER: Rapier, world: RAPIER.World, terrain: Terrain, roadAssets: RoadAssets) {
     this.RAPIER = RAPIER;
     this.world = world;
     this.terrain = terrain;
+    this.roadAssets = roadAssets;
   }
 
   /**
@@ -192,8 +255,9 @@ export class RoadSystem {
     const incoming = this.incomingDirection(cell)!;
     const facing = (incoming + 2) % 4; // ramp launches away from the connected neighbor
     const center = this.cellWorldCenter(cell);
+    const pitch = computeTerrainPitch(this.terrain, center.x, center.z, facing);
 
-    const tile = new RoadTile(this.RAPIER, this.world, cell, kind, center.y, facing);
+    const tile = new RoadTile(this.RAPIER, this.world, cell, kind, center.y, facing, this.roadAssets, pitch);
     tile.group.position.copy(center);
     this.root.add(tile.group);
 

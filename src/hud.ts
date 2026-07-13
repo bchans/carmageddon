@@ -19,6 +19,10 @@ const UPGRADE_LABELS: Record<UpgradeKey, string> = {
 export interface HudCallbacks {
   onSelectRoad: (kind: RoadKind) => void;
   onBuyUpgrade: (key: UpgradeKey) => void;
+  onZoomIn: () => void;
+  onZoomOut: () => void;
+  onLocateSpawn: () => void;
+  onLocateTarget: () => void;
 }
 
 export class Hud {
@@ -74,6 +78,23 @@ export class Hud {
     buildPanel.appendChild(upgradeRow);
 
     this.root.appendChild(buildPanel);
+
+    const viewControls = document.createElement("div");
+    viewControls.className = "hud-view-controls";
+    const makeViewBtn = (label: string, onClick: () => void): HTMLButtonElement => {
+      const btn = document.createElement("button");
+      btn.className = "hud-view-btn";
+      btn.textContent = label;
+      btn.addEventListener("click", onClick);
+      viewControls.appendChild(btn);
+      return btn;
+    };
+    makeViewBtn("+", callbacks.onZoomIn);
+    makeViewBtn("−", callbacks.onZoomOut);
+    makeViewBtn("Spawn", callbacks.onLocateSpawn);
+    makeViewBtn("Target", callbacks.onLocateTarget);
+    this.root.appendChild(viewControls);
+
     mount.appendChild(this.root);
   }
 

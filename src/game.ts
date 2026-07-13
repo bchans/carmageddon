@@ -5,9 +5,10 @@ import { Terrain } from "./terrain";
 import { Car } from "./car";
 import { RoadSystem, RoadKind, TILE_SIZE, SPEED_MULTIPLIER } from "./roads";
 import { Economy, ROAD_COST, TOLL_REWARD } from "./economy";
-import { CameraController } from "./input";
+import { CameraController, MIN_ZOOM, MAX_ZOOM } from "./input";
 import { Autopilot } from "./autopilot";
 import { Hud } from "./hud";
+import { loadAssets } from "./assets";
 
 const FIXED_DT = 1 / 60;
 const TARGET_REACHED_RADIUS = TILE_SIZE * 1.1;
@@ -66,15 +67,13 @@ export class Game {
   }
 
   async start(): Promise<void> {
-    this.RAPIER = await initPhysics();
-    this.world = new this.RAPIER.World({ x: 0, y: -16, z: 0 });
-    this.world.timestep = FIXED_DT;
+    const [, assets] = await Promise.all([this.initPhysicsWorld(), loadAssets()]);
 
     this.setupLights();
     this.terrain = Terrain.generate(this.RAPIER, this.world, 1);
     this.scene.add(this.terrain.mesh, this.terrain.waterMesh);
 
-    this.roads = new RoadSystem(this.RAPIER, this.world, this.terrain);
+    this.roads = new RoadSystem(this.RAPIER, this.world, this.terrain, assets.road);
     this.scene.add(this.roads.root);
 
     this.spawnWorld = this.pickEdgePoint(-1);
@@ -83,7 +82,7 @@ export class Game {
 
     const initialSpawn = this.spawnWorld.clone();
     initialSpawn.y += 1;
-    this.car = new Car(this.RAPIER, this.world, initialSpawn, this.economy.computeCarStats());
+    this.car = new Car(this.RAPIER, this.world, initialSpawn, assets.carScene, this.economy.computeCarStats());
     this.car.mesh.visible = false; // hidden until the build countdown elapses
     this.scene.add(this.car.mesh);
 
@@ -114,6 +113,14 @@ export class Game {
           this.hud.update(this.economy);
         }
       },
+      onZoomIn: () => {
+        this.cameraController.zoom = Math.min(MAX_ZOOM, this.cameraController.zoom * 1.3);
+      },
+      onZoomOut: () => {
+        this.cameraController.zoom = Math.max(MIN_ZOOM, this.cameraController.zoom / 1.3);
+      },
+      onLocateSpawn: () => this.cameraController.panOffset.set(this.spawnWorld.x, this.spawnWorld.z),
+      onLocateTarget: () => this.cameraController.panOffset.set(this.targetWorld.x, this.targetWorld.z),
     });
     this.hud.setSelectedRoad(this.selectedRoadKind);
     this.hud.update(this.economy);
@@ -121,6 +128,12 @@ export class Game {
 
     this.onResize();
     this.renderer.setAnimationLoop(this.loop);
+  }
+
+  private async initPhysicsWorld(): Promise<void> {
+    this.RAPIER = await initPhysics();
+    this.world = new this.RAPIER.World({ x: 0, y: -16, z: 0 });
+    this.world.timestep = FIXED_DT;
   }
 
   private setupLights(): void {

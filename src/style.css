@@ -137,3 +137,32 @@ canvas {
   padding: 10px 24px;
 }
 
+.hud-view-controls {
+  position: absolute;
+  right: 16px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  pointer-events: auto;
+}
+
+.hud-view-btn {
+  width: 52px;
+  height: 44px;
+  background: rgba(10, 14, 22, 0.78);
+  color: #f2f2f2;
+  border: 1px solid #3d4b6e;
+  border-radius: 10px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  backdrop-filter: blur(4px);
+  transition: background 0.15s ease;
+}
+
+.hud-view-btn:hover {
+  background: #384470;
+}
+

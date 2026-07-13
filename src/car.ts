@@ -31,6 +31,10 @@ const CHASSIS_HALF_EXTENTS = { x: 0.85, y: 0.32, z: 1.85 };
 const WHEEL_RADIUS = 0.42;
 const WHEEL_HALF_TRACK = 0.82;
 const SUSPENSION_REST = 0.35;
+// Kenney's sedan.glb body is 2.55 native units long; scale it to roughly
+// match the (already physics-tuned) chassis length.
+const MODEL_SCALE = (CHASSIS_HALF_EXTENTS.z * 2) / 2.55;
+const WHEEL_NODE_NAMES = ["wheel-front-left", "wheel-front-right", "wheel-back-left", "wheel-back-right"];
 export const MAX_STEER = 0.7; // radians
 export const WHEELBASE = 2.5; // distance between front and rear axles (matches WHEEL_LOCAL_POSITIONS z spacing)
 const MAX_SPEED = 11; // m/s cruising speed cap, used for grounded kinematic driving
@@ -51,7 +55,8 @@ export class Car {
   readonly chassisBody: RAPIER.RigidBody;
   readonly controller: RAPIER.DynamicRayCastVehicleController;
   readonly mesh: THREE.Group;
-  readonly wheelMeshes: THREE.Object3D[] = [];
+  readonly wheelMeshes: THREE.Object3D[];
+  private readonly wheelBasePositions: THREE.Vector3[];
   stats: CarStats;
   boostFuel: number;
   /** External multiplier applied to engine force, e.g. boost pads / mud patches. */
@@ -59,7 +64,13 @@ export class Car {
 
   private steerAngle = 0;
 
-  constructor(RAPIER: Rapier, world: RAPIER.World, spawn: THREE.Vector3, stats: CarStats = BASE_CAR_STATS) {
+  constructor(
+    RAPIER: Rapier,
+    world: RAPIER.World,
+    spawn: THREE.Vector3,
+    carScene: THREE.Object3D,
+    stats: CarStats = BASE_CAR_STATS,
+  ) {
     this.stats = { ...stats };
     this.boostFuel = stats.boostCapacity;
 
@@ -98,13 +109,10 @@ export class Car {
       this.controller.setWheelSideFrictionStiffness(i, 4.5);
     }
 
-    this.mesh = buildCarMesh();
-    for (const pos of WHEEL_LOCAL_POSITIONS) {
-      const wheel = buildWheelMesh();
-      wheel.position.set(pos.x, -CHASSIS_HALF_EXTENTS.y * 0.6, pos.z);
-      this.mesh.add(wheel);
-      this.wheelMeshes.push(wheel);
-    }
+    const built = buildCarMesh(carScene);
+    this.mesh = built.group;
+    this.wheelMeshes = built.wheelMeshes;
+    this.wheelBasePositions = built.wheelBasePositions;
   }
 
   get position(): THREE.Vector3 {
@@ -204,12 +212,17 @@ export class Car {
     this.mesh.position.set(t.x, t.y, t.z);
     this.mesh.quaternion.set(r.x, r.y, r.z, r.w);
 
+    const restConnectionY = -CHASSIS_HALF_EXTENTS.y * 0.6;
     for (let i = 0; i < this.wheelMeshes.length; i++) {
       const wheel = this.wheelMeshes[i];
       const connection = this.controller.wheelChassisConnectionPointCs(i);
       const suspensionLength = this.controller.wheelSuspensionLength(i) ?? SUSPENSION_REST;
-      const base = WHEEL_LOCAL_POSITIONS[i];
-      wheel.position.set(base.x, (connection?.y ?? 0) - suspensionLength, base.z);
+      // Suspension bob relative to rest, applied on top of the model's own
+      // native wheel position (rather than the physics raycast coordinates)
+      // so the real wheel meshes stay correctly attached to the car body.
+      const suspensionDelta = (connection?.y ?? restConnectionY) - suspensionLength - (restConnectionY - SUSPENSION_REST);
+      const base = this.wheelBasePositions[i];
+      wheel.position.set(base.x, base.y + suspensionDelta, base.z);
       const rotation = this.controller.wheelRotation(i) ?? 0;
       const steer = FRONT_WHEELS.includes(i) ? this.steerAngle : 0;
       wheel.rotation.set(0, steer, 0);
@@ -218,36 +231,45 @@ export class Car {
   }
 }
 
-function buildCarMesh(): THREE.Group {
-  const group = new THREE.Group();
-  const bodyGeo = new THREE.BoxGeometry(
-    CHASSIS_HALF_EXTENTS.x * 2,
-    CHASSIS_HALF_EXTENTS.y * 2,
-    CHASSIS_HALF_EXTENTS.z * 2,
-  );
-  const bodyMat = new THREE.MeshStandardMaterial({ color: 0xd63c3c, roughness: 0.5, metalness: 0.2 });
-  const body = new THREE.Mesh(bodyGeo, bodyMat);
-  body.castShadow = true;
-  group.add(body);
-
-  const cabinGeo = new THREE.BoxGeometry(
-    CHASSIS_HALF_EXTENTS.x * 1.5,
-    CHASSIS_HALF_EXTENTS.y * 1.3,
-    CHASSIS_HALF_EXTENTS.z * 1.0,
-  );
-  const cabin = new THREE.Mesh(cabinGeo, bodyMat);
-  cabin.position.set(0, CHASSIS_HALF_EXTENTS.y * 1.5, 0.2);
-  cabin.castShadow = true;
-  group.add(cabin);
-
-  return group;
+interface BuiltCarMesh {
+  group: THREE.Group;
+  wheelMeshes: THREE.Object3D[];
+  wheelBasePositions: THREE.Vector3[];
 }
 
-function buildWheelMesh(): THREE.Object3D {
-  const geo = new THREE.CylinderGeometry(WHEEL_RADIUS, WHEEL_RADIUS, 0.32, 16);
-  geo.rotateZ(Math.PI / 2);
-  const mat = new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.9 });
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.castShadow = true;
-  return mesh;
+/**
+ * Builds the visual car from the loaded Kenney sedan.glb template: the body
+ * and each named wheel node are detached into a fresh group, scaled to match
+ * the (physics-tuned) chassis size. Wheel base positions are recorded so
+ * syncMesh can animate suspension bob/steer/roll on top of the model's own
+ * natural wheel placement instead of the physics raycast coordinates.
+ */
+function buildCarMesh(carScene: THREE.Object3D): BuiltCarMesh {
+  const root = carScene.clone(true);
+  const group = new THREE.Group();
+
+  const body = root.getObjectByName("body")!;
+  body.scale.setScalar(MODEL_SCALE);
+  body.position.multiplyScalar(MODEL_SCALE);
+  group.add(body);
+
+  const wheelMeshes: THREE.Object3D[] = [];
+  const wheelBasePositions: THREE.Vector3[] = [];
+  for (const name of WHEEL_NODE_NAMES) {
+    const wheel = root.getObjectByName(name)!;
+    wheel.scale.setScalar(MODEL_SCALE);
+    wheel.position.multiplyScalar(MODEL_SCALE);
+    group.add(wheel);
+    wheelMeshes.push(wheel);
+    wheelBasePositions.push(wheel.position.clone());
+  }
+
+  group.traverse((obj) => {
+    if (obj instanceof THREE.Mesh) {
+      obj.castShadow = true;
+      obj.receiveShadow = true;
+    }
+  });
+
+  return { group, wheelMeshes, wheelBasePositions };
 }
