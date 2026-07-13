@@ -12,6 +12,7 @@ import { Hud } from "./hud";
 const FIXED_DT = 1 / 60;
 const TARGET_REACHED_RADIUS = TILE_SIZE * 1.1;
 const SPAWN_MARGIN = 14;
+const BUILD_TIME = 24; // seconds of build time before the car departs each round
 
 const CAMERA_BASE_HEIGHT = 70;
 const CAMERA_BASE_BACK = 45;
@@ -36,11 +37,16 @@ export class Game {
   private selectedRoadKind: RoadKind = RoadKind.Standard;
   private spawnWorld = new THREE.Vector3();
   private targetWorld = new THREE.Vector3();
+  private spawnMarker!: THREE.Object3D;
   private targetMarker!: THREE.Object3D;
   private hoverMarker!: THREE.Mesh;
   private rng: () => number;
   private levelSeed = 1;
   private container: HTMLElement;
+
+  private carActive = false;
+  private buildTimer = BUILD_TIME;
+  private lastCountdownSecond = -1;
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -72,9 +78,15 @@ export class Game {
     const initialSpawn = this.spawnWorld.clone();
     initialSpawn.y += 1;
     this.car = new Car(this.RAPIER, this.world, initialSpawn, this.economy.computeCarStats());
+    this.car.mesh.visible = false; // hidden until the build countdown elapses
     this.scene.add(this.car.mesh);
 
-    this.targetMarker = buildMarker(0xffd23f);
+    this.spawnMarker = buildMarker(0x4ade80, true);
+    this.scene.add(this.spawnMarker);
+    this.spawnMarker.position.copy(this.spawnWorld);
+    this.spawnMarker.position.y += 2.2;
+
+    this.targetMarker = buildMarker(0xffd23f, false);
     this.scene.add(this.targetMarker);
     this.hoverMarker = buildHoverMarker();
     this.scene.add(this.hoverMarker);
@@ -99,7 +111,7 @@ export class Game {
     });
     this.hud.setSelectedRoad(this.selectedRoadKind);
     this.hud.update(this.economy);
-    this.refreshPath();
+    this.updateCountdownStatus();
 
     this.onResize();
     this.renderer.setAnimationLoop(this.loop);
@@ -219,6 +231,16 @@ export class Game {
   };
 
   private stepPhysics(dt: number): void {
+    if (!this.carActive) {
+      this.buildTimer -= dt;
+      this.updateCountdownStatus();
+      this.car.speedZoneMultiplier = 1;
+      this.car.update(dt, { throttle: 0, steer: 0, brake: true, boost: false });
+      this.world.step();
+      if (this.buildTimer <= 0) this.activateCar();
+      return;
+    }
+
     const p = this.car.position;
     const onRoad = this.roads.getKindAt(p.x, p.z);
     if (onRoad) {
@@ -240,6 +262,20 @@ export class Game {
     }
   }
 
+  private activateCar(): void {
+    this.carActive = true;
+    this.car.respawn(this.spawnWorld.clone().setY(this.spawnWorld.y + 1));
+    this.car.mesh.visible = true;
+    this.refreshPath();
+  }
+
+  private updateCountdownStatus(): void {
+    const seconds = Math.max(0, Math.ceil(this.buildTimer));
+    if (seconds === this.lastCountdownSecond) return;
+    this.lastCountdownSecond = seconds;
+    this.hud.setStatus(`Build phase — car departs in ${seconds}s`);
+  }
+
   private onTollReached(): void {
     this.economy.addToll();
     this.hud.showMessage(`Toll paid! +${TOLL_REWARD} — build the next road.`);
@@ -248,8 +284,12 @@ export class Game {
     this.roads.setEndpoints(this.spawnWorld, this.targetWorld);
     this.updateTargetMarker();
     this.hud.update(this.economy);
-    this.car.respawn(this.spawnWorld.clone().setY(this.spawnWorld.y + 1));
-    this.refreshPath();
+
+    this.carActive = false;
+    this.car.mesh.visible = false;
+    this.buildTimer = BUILD_TIME;
+    this.lastCountdownSecond = -1;
+    this.autopilot.clearPath();
   }
 
   private updateCamera(): void {
@@ -261,12 +301,13 @@ export class Game {
   }
 }
 
-function buildMarker(color: number): THREE.Object3D {
+/** A pin-style marker; `pointUp` makes it an upward "start here" arrow instead of a downward landing pin. */
+function buildMarker(color: number, pointUp: boolean): THREE.Object3D {
   const group = new THREE.Group();
   const geo = new THREE.ConeGeometry(1.1, 2.4, 12);
   const mat = new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 0.3 });
   const cone = new THREE.Mesh(geo, mat);
-  cone.rotation.x = Math.PI;
+  if (!pointUp) cone.rotation.x = Math.PI;
   group.add(cone);
   return group;
 }
