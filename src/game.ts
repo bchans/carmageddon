@@ -12,13 +12,13 @@ import { loadAssets } from "./assets";
 
 const FIXED_DT = 1 / 60;
 const TARGET_REACHED_RADIUS = TILE_SIZE * 1.1;
-const SPAWN_MARGIN = 10;
+const SPAWN_MARGIN = 5;
 const BUILD_TIME = 24; // seconds of build time before the car departs each round
 
 // The very first target sits close to spawn (cheap, quick win); each round
 // after that pushes the next target progressively farther out, so difficulty
 // ramps instead of demanding a full map-width connection from round one.
-const MIN_TARGET_DIST = 16;
+const MIN_TARGET_DIST = 8;
 const RAMP_ROUNDS = 6;
 
 const CAMERA_BASE_HEIGHT = 70;

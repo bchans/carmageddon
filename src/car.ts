@@ -250,10 +250,21 @@ function buildCarMesh(carScene: THREE.Object3D): BuiltCarMesh {
   const root = carScene.clone(true);
   const group = new THREE.Group();
 
+  // The source model's own "wheel-front-*" nodes sit at local +Z, but forward
+  // is local -Z (see WHEEL_LOCAL_POSITIONS below, and syncMesh which drives
+  // `group`'s rotation straight from physics each frame) — so the hood
+  // visually trails instead of leading unless the whole assembly is flipped
+  // 180° first. That flip has to live on this inner `visual` group rather
+  // than `group` itself, since `group`'s own rotation gets overwritten by
+  // the chassis's physics quaternion every frame in syncMesh.
+  const visual = new THREE.Group();
+  visual.rotation.y = Math.PI;
+  group.add(visual);
+
   const body = root.getObjectByName("body")!;
   body.scale.setScalar(MODEL_SCALE);
   body.position.multiplyScalar(MODEL_SCALE);
-  group.add(body);
+  visual.add(body);
 
   const wheelMeshes: THREE.Object3D[] = [];
   const wheelBasePositions: THREE.Vector3[] = [];
@@ -261,7 +272,7 @@ function buildCarMesh(carScene: THREE.Object3D): BuiltCarMesh {
     const wheel = root.getObjectByName(name)!;
     wheel.scale.setScalar(MODEL_SCALE);
     wheel.position.multiplyScalar(MODEL_SCALE);
-    group.add(wheel);
+    visual.add(wheel);
     wheelMeshes.push(wheel);
     wheelBasePositions.push(wheel.position.clone());
   }

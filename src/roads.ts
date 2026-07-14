@@ -272,6 +272,16 @@ function buildKenneyMesh(
   return mesh;
 }
 
+// Below this grade a rotated flat piece reads as flat anyway; above it, a
+// rotated flat plane just looks like a thin tilted sheet rather than an
+// actual sloped road, so buildInclineMesh's solid wedge takes over instead.
+// Kenney's own "slant" piece (used for the launch Ramp) turns out to be a
+// jump ramp — flat with a sharp kick at the very end, not a uniform climb —
+// so it doesn't fit here; this wedge is built to exactly match the graded
+// terrain instead.
+const INCLINE_THRESHOLD_PITCH = 0.03;
+const WEDGE_BASE_DEPTH = 0.4; // how far the wedge's solid body extends below its lowest driving-surface point
+
 function buildStraightMesh(
   kind: RoadKind,
   axisIsZ: boolean,
@@ -279,6 +289,9 @@ function buildStraightMesh(
   cell: Cell,
   pitch: number,
 ): THREE.Object3D {
+  if (Math.abs(pitch) > INCLINE_THRESHOLD_PITCH) {
+    return buildInclineMesh(kind, axisIsZ, pitch);
+  }
   // Every third plain "Road" tile (deterministic by position, so it doesn't
   // flicker between rebuilds) gets Kenney's lightpost variant for a bit of
   // streetscape variety instead of only ever using the bare straight piece.
@@ -286,6 +299,57 @@ function buildStraightMesh(
   const template = useLightposts ? roadAssets.straightLightposts : roadAssets.straight;
   // Straight template runs along local Z (native N/S); rotate 90° for an E/W run.
   return buildKenneyMesh(template, axisIsZ ? 0 : Math.PI / 2, kind, CITYBUILDER_SWATCH_LINEAR, pitch);
+}
+
+/**
+ * A solid wedge block whose slanted top face is the driving surface, built
+ * to exactly match the graded terrain under it (see RoadSystem.computeSlope)
+ * rather than a flat plane rotated to approximate a slope.
+ */
+function buildInclineMesh(kind: RoadKind, axisIsZ: boolean, pitch: number): THREE.Object3D {
+  const half = TILE_SIZE / 2;
+  const rise = TILE_SIZE * Math.tan(pitch);
+  // DECAL_HEIGHT clearance so the driving surface doesn't z-fight the flattened
+  // terrain directly underneath it, same as every other road piece.
+  const yLo = rise / 2 + DECAL_HEIGHT; // at the tile's low-direction edge (S for a N/S run, W for an E/W run)
+  const yHi = -rise / 2 + DECAL_HEIGHT; // at the tile's high-direction edge
+  const baseY = Math.min(yLo, yHi) - WEDGE_BASE_DEPTH;
+
+  const along = (t: number, across: number, y: number): [number, number, number] =>
+    axisIsZ ? [across, y, t] : [t, y, across];
+
+  const blB = along(-half, -half, baseY);
+  const brB = along(-half, half, baseY);
+  const flB = along(half, -half, baseY);
+  const frB = along(half, half, baseY);
+  const blT = along(-half, -half, yLo);
+  const brT = along(-half, half, yLo);
+  const flT = along(half, -half, yHi);
+  const frT = along(half, half, yHi);
+
+  const quads: Array<[number, number, number][]> = [
+    [blT, flT, frT, brT], // top (slanted driving surface)
+    [blB, brB, frB, flB], // bottom
+    [blB, blT, brT, brB], // low-direction end wall
+    [flB, frB, frT, flT], // high-direction end wall
+    [blB, flB, flT, blT], // -across side
+    [brB, brT, frT, frB], // +across side
+  ];
+
+  const positions: number[] = [];
+  for (const [a, b, c, d] of quads) {
+    positions.push(...a, ...b, ...c, ...a, ...c, ...d);
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geo.computeVertexNormals();
+
+  const mat = new THREE.MeshStandardMaterial({ color: TILE_TARGET_COLOR[kind], roughness: 0.95, side: THREE.DoubleSide });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  return mesh;
 }
 
 function buildPlateMesh(kind: RoadKind, roadAssets: RoadAssets): THREE.Object3D {

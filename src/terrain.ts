@@ -4,8 +4,8 @@ import type RAPIER from "@dimforge/rapier3d-compat";
 import type { Rapier } from "./physics";
 
 /** Square terrain: world spans [-size/2, size/2] on both X and Z. */
-export const TERRAIN_SIZE = 120;
-export const TERRAIN_SEGMENTS = 60; // vertices per side = SEGMENTS + 1
+export const TERRAIN_SIZE = 60;
+export const TERRAIN_SEGMENTS = 30; // vertices per side = SEGMENTS + 1; keeps the same vertex spacing as before at half the map size
 const GRID = TERRAIN_SEGMENTS + 1;
 const SPACING = TERRAIN_SIZE / TERRAIN_SEGMENTS;
 
@@ -160,29 +160,31 @@ export class Terrain {
    * Grades the ground under a road tile to match `heightAt` (a flat constant
    * for junction pieces, or a linear ramp along the travel axis for a sloped
    * straight run) so the pavement never floats above or clips through the
-   * terrain, then softens a one-ring margin around it into an embankment
-   * instead of a hard cliff. Rebuilds both the visual mesh and the physics
-   * heightfield to match.
+   * terrain. Rebuilds both the visual mesh and the physics heightfield to
+   * match.
+   *
+   * Only touches this tile's own footprint (chebyshev <= coreRadius) —
+   * a wider cosmetic "embankment" margin used to live here too, but at this
+   * grid spacing (TILE_SIZE is exactly 2 grid steps) that margin reached a
+   * full tile-width out, so placing a tile could quietly blend its own
+   * *already-placed* neighbor's footprint toward a different height. Since a
+   * road mesh's shape/geometry is computed once at placement time and never
+   * resynced with the terrain afterwards, that later blend silently pulled
+   * the ground out from under the neighbor's already-built mesh, most
+   * visibly as a gap on sloped (wedge) tiles that need every vertex exact.
    */
   flattenForRoad(centerX: number, centerZ: number, halfSize: number, heightAt: (x: number, z: number) => number): void {
     const { ix: cix, iy: ciy } = worldToGrid(centerX, centerZ);
     const coreRadius = Math.max(1, Math.round(halfSize / SPACING));
-    const marginRadius = coreRadius + 1;
-    for (let dy = -marginRadius; dy <= marginRadius; dy++) {
-      for (let dx = -marginRadius; dx <= marginRadius; dx++) {
+    for (let dy = -coreRadius; dy <= coreRadius; dy++) {
+      for (let dx = -coreRadius; dx <= coreRadius; dx++) {
         const ix = cix + dx;
         const iy = ciy + dy;
         if (ix < 0 || ix >= GRID || iy < 0 || iy >= GRID) continue;
         const i = idx(iy, ix);
         const worldX = -TERRAIN_SIZE / 2 + ix * SPACING;
         const worldZ = -TERRAIN_SIZE / 2 + iy * SPACING;
-        const target = heightAt(worldX, worldZ);
-        const chebyshev = Math.max(Math.abs(dx), Math.abs(dy));
-        if (chebyshev <= coreRadius) {
-          this.heights[i] = target;
-        } else {
-          this.heights[i] = THREE.MathUtils.lerp(this.heights[i], target, 0.35);
-        }
+        this.heights[i] = heightAt(worldX, worldZ);
       }
     }
     this.rebuildMeshFromHeights();
