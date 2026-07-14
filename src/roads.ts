@@ -7,7 +7,6 @@ import type { RoadAssets } from "./assets";
 export const TILE_SIZE = 4;
 const CURB_HEIGHT = 0.6;
 const CURB_THICKNESS = 0.25;
-const ROAD_WIDTH = 2.6;
 // Height the pavement decal sits above the (now flattened-flush) terrain, purely
 // to avoid z-fighting with the ground mesh underneath it.
 const DECAL_HEIGHT = 0.08;
@@ -152,150 +151,95 @@ function disposeObject3D(obj: THREE.Object3D): void {
   });
 }
 
-// --- Procedural road surfaces --------------------------------------------
+// --- Road surfaces ---------------------------------------------------------
 //
-// Every road kind other than Ramp is built from flat decal geometry sized to
-// the tile's actual connectivity (a straight strip, a corner arc, or a full
-// intersection plate), so a tile's shape always matches how it connects to
-// its neighbors instead of a fixed template baked in at placement time.
+// Straight runs and 3-/4-way junctions reuse Kenney's actual city-kit-roads
+// meshes (real geometry: curb bevels, corner accents, lane dashes). Kenney's
+// kit has no dedicated curve/bend piece though, so bends fall back to a
+// procedurally-built quarter-annulus strip, colored to match.
+//
+// Kenney's shared atlas swatch that these pieces sample reads as a dark
+// slate-navy (~rgb(84,88,105) — measured directly off the rendered mesh
+// under neutral lighting, not a color-space bug), not the light grey/white
+// asphalt the game wants. TINT_MULTIPLIER recolors it: material.color
+// multiplies the mapped texture in the renderer's linear working space, so
+// the multiplier is derived by converting both the measured swatch and the
+// desired target through the sRGB transfer function rather than guessing a
+// flat replacement color (which would just crush the lane-line contrast).
+function srgbToLinear(c: number): number {
+  return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+const ATLAS_ROAD_SWATCH_LINEAR = [84 / 255, 88 / 255, 105 / 255].map(srgbToLinear);
+function tintMultiplierFor(targetHex: number): THREE.Color {
+  const target = new THREE.Color(targetHex); // hex ctor converts sRGB -> linear working space
+  return new THREE.Color(
+    target.r / ATLAS_ROAD_SWATCH_LINEAR[0],
+    target.g / ATLAS_ROAD_SWATCH_LINEAR[1],
+    target.b / ATLAS_ROAD_SWATCH_LINEAR[2],
+  );
+}
 
-const TILE_BASE_COLOR: Record<RoadKind, number> = {
-  [RoadKind.Standard]: 0x5b6270,
-  [RoadKind.Crossroad]: 0x5b6270,
-  [RoadKind.Ramp]: 0xaeb4bd,
-  [RoadKind.Boost]: 0xe8862c,
-  [RoadKind.Mud]: 0x5a4429,
+const TILE_TARGET_COLOR: Record<RoadKind, number> = {
+  [RoadKind.Standard]: 0xacaeb4,
+  [RoadKind.Crossroad]: 0xacaeb4,
+  [RoadKind.Ramp]: 0xacaeb4,
+  [RoadKind.Boost]: 0xffa53d,
+  [RoadKind.Mud]: 0x6b5636,
 };
-const TILE_LINE_COLOR: Record<RoadKind, string> = {
-  [RoadKind.Standard]: "#eef1f5",
-  [RoadKind.Crossroad]: "#eef1f5",
-  [RoadKind.Ramp]: "#eef1f5",
-  [RoadKind.Boost]: "#fff4e0",
-  [RoadKind.Mud]: "#8a6b3f",
-};
 
-const laneTextures = new Map<RoadKind, THREE.CanvasTexture>();
-function laneTextureFor(kind: RoadKind): THREE.CanvasTexture {
-  let tex = laneTextures.get(kind);
-  if (tex) return tex;
-  const size = 64;
-  const canvas = document.createElement("canvas");
-  canvas.width = size;
-  canvas.height = size;
-  const ctx = canvas.getContext("2d")!;
-  ctx.fillStyle = `#${TILE_BASE_COLOR[kind].toString(16).padStart(6, "0")}`;
-  ctx.fillRect(0, 0, size, size);
-  ctx.fillStyle = TILE_LINE_COLOR[kind];
-  ctx.fillRect(size * 0.46, size * 0.08, size * 0.08, size * 0.32);
-  ctx.fillRect(size * 0.46, size * 0.6, size * 0.08, size * 0.32);
-  tex = new THREE.CanvasTexture(canvas);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  laneTextures.set(kind, tex);
-  return tex;
-}
-
-function buildStraightMesh(kind: RoadKind, axisIsZ: boolean): THREE.Object3D {
-  const width = axisIsZ ? ROAD_WIDTH : TILE_SIZE;
-  const depth = axisIsZ ? TILE_SIZE : ROAD_WIDTH;
-  const geo = new THREE.PlaneGeometry(width, depth);
-  geo.rotateX(-Math.PI / 2);
-  const mat = new THREE.MeshStandardMaterial({ map: laneTextureFor(kind), roughness: 0.95 });
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.position.y = DECAL_HEIGHT;
-  mesh.receiveShadow = true;
-  return mesh;
-}
-
-function buildPlateMesh(kind: RoadKind): THREE.Object3D {
-  const geo = new THREE.PlaneGeometry(TILE_SIZE, TILE_SIZE);
-  geo.rotateX(-Math.PI / 2);
-  const mat = new THREE.MeshStandardMaterial({ color: TILE_BASE_COLOR[kind], roughness: 0.95 });
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.position.y = DECAL_HEIGHT;
-  mesh.receiveShadow = true;
-  return mesh;
-}
-
-/** Builds a quarter-annulus pavement strip connecting the two given (tile-local) edge directions. */
-function buildCurveGeometry(dirA: number, dirB: number): THREE.BufferGeometry {
-  const A = DIRS[dirA];
-  const B = DIRS[dirB];
-  const half = TILE_SIZE / 2;
-  const cx = (A.dc + B.dc) * half;
-  const cz = (A.dr + B.dr) * half;
-  const angleA = Math.atan2(-B.dr, -B.dc);
-  const angleB = Math.atan2(-A.dr, -A.dc);
-  let delta = angleB - angleA;
-  while (delta > Math.PI) delta -= Math.PI * 2;
-  while (delta < -Math.PI) delta += Math.PI * 2;
-
-  const inner = half - ROAD_WIDTH / 2;
-  const outer = half + ROAD_WIDTH / 2;
-  const segments = 12;
-  const positions: number[] = [];
-  const indices: number[] = [];
-  for (let i = 0; i <= segments; i++) {
-    const t = i / segments;
-    const ang = angleA + delta * t;
-    const cos = Math.cos(ang);
-    const sin = Math.sin(ang);
-    positions.push(cx + inner * cos, DECAL_HEIGHT, cz + inner * sin);
-    positions.push(cx + outer * cos, DECAL_HEIGHT, cz + outer * sin);
-    if (i < segments) {
-      const base = i * 2;
-      indices.push(base, base + 1, base + 2, base + 1, base + 3, base + 2);
-    }
-  }
-
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-  geo.setIndex(indices);
-  geo.computeVertexNormals();
-  return geo;
-}
-
-function buildCurveMesh(kind: RoadKind, dirA: number, dirB: number): THREE.Object3D {
-  const geo = buildCurveGeometry(dirA, dirB);
-  const mat = new THREE.MeshStandardMaterial({ color: TILE_BASE_COLOR[kind], roughness: 0.95, side: THREE.DoubleSide });
-  const mesh = new THREE.Mesh(geo, mat);
-  mesh.receiveShadow = true;
-  return mesh;
-}
-
-function buildRampMesh(facing: number, roadAssets: RoadAssets): THREE.Object3D {
-  const mesh = roadAssets.ramp.clone(true);
+/** Clones a Kenney road template and recolors it via the gamma-correct tint multiplier. */
+function buildKenneyMesh(template: THREE.Object3D, rotationY: number, kind: RoadKind): THREE.Object3D {
+  const mesh = template.clone(true);
   mesh.scale.setScalar(TILE_SIZE);
-  mesh.rotation.set(0, facing * (Math.PI / 2), 0);
+  mesh.rotation.set(0, rotationY, 0);
+  const tint = tintMultiplierFor(TILE_TARGET_COLOR[kind]);
   mesh.traverse((obj) => {
     if (!(obj instanceof THREE.Mesh)) return;
     obj.castShadow = true;
     obj.receiveShadow = true;
     const base = Array.isArray(obj.material) ? obj.material[0] : obj.material;
     const cloned = (base as THREE.MeshStandardMaterial).clone();
-    // Drop the source atlas texture (a dark asphalt swatch) so the ramp reads
-    // as the same flat grey as the rest of the procedural road pieces.
-    cloned.map = null;
-    cloned.color = new THREE.Color(TILE_BASE_COLOR[RoadKind.Ramp]);
+    cloned.color = tint;
     obj.material = cloned;
   });
   return mesh;
 }
 
-/** Picks straight / curve / intersection-plate shape from the tile's actual live connectivity. */
+function buildStraightMesh(kind: RoadKind, axisIsZ: boolean, roadAssets: RoadAssets): THREE.Object3D {
+  // Straight template runs along local Z; rotate 90° for an E/W run.
+  return buildKenneyMesh(roadAssets.straight, axisIsZ ? 0 : Math.PI / 2, kind);
+}
+
+function buildPlateMesh(kind: RoadKind, roadAssets: RoadAssets): THREE.Object3D {
+  return buildKenneyMesh(roadAssets.crossroad, 0, kind);
+}
+
+function buildRampMesh(facing: number, roadAssets: RoadAssets): THREE.Object3D {
+  return buildKenneyMesh(roadAssets.ramp, facing * (Math.PI / 2), RoadKind.Ramp);
+}
+
+/**
+ * Picks straight vs. intersection-plate shape from the tile's actual live
+ * connectivity. Kenney's kit has no dedicated curve/bend piece, and their
+ * straight/crossroad pieces are full-tile-width opaque squares (not a
+ * narrower lane strip), so a custom-width procedural curve wouldn't line up
+ * with their edges anyway — a bend reuses the crossroad plate instead, which
+ * is already a full paved square and joins cleanly with a neighboring
+ * straight piece, with curbs closing off the two unused sides.
+ */
 function buildTileMesh(kind: RoadKind, facing: number, mask: boolean[], roadAssets: RoadAssets): THREE.Object3D {
   if (kind === RoadKind.Ramp) return buildRampMesh(facing, roadAssets);
-  if (kind === RoadKind.Crossroad) return buildPlateMesh(kind);
+  if (kind === RoadKind.Crossroad) return buildPlateMesh(kind, roadAssets);
 
   const dirs = [0, 1, 2, 3].filter((d) => mask[d]);
-  if (dirs.length >= 3) return buildPlateMesh(kind);
   if (dirs.length === 2) {
     const [a, b] = dirs;
     const opposite = (a + 2) % 4 === b;
-    if (opposite) return buildStraightMesh(kind, a % 2 === 0);
-    return buildCurveMesh(kind, a, b);
+    if (opposite) return buildStraightMesh(kind, a % 2 === 0, roadAssets);
   }
-  if (dirs.length === 1) return buildStraightMesh(kind, dirs[0] % 2 === 0);
-  return buildStraightMesh(kind, true);
+  if (dirs.length === 1) return buildStraightMesh(kind, dirs[0] % 2 === 0, roadAssets);
+  if (dirs.length === 0) return buildStraightMesh(kind, true, roadAssets);
+  return buildPlateMesh(kind, roadAssets); // bend (2 adjacent), T (3), or 4-way
 }
 
 export class RoadSystem {

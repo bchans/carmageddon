@@ -2,6 +2,8 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 
 export interface RoadAssets {
+  straight: THREE.Object3D;
+  crossroad: THREE.Object3D;
   ramp: THREE.Object3D;
 }
 
@@ -23,14 +25,15 @@ function loadGltf(url: string): Promise<THREE.Object3D> {
   });
 }
 
-/** Loads the Kenney car-kit / city-kit-roads GLB models used for visuals. Straight/crossroad/curve
- * road pieces are built procedurally (see roads.ts) so tiles can connect correctly and stay
- * grey/white regardless of how many neighbors a tile ends up with; only the ramp keeps its GLB. */
+/** Loads the Kenney car-kit / city-kit-roads GLB models used for visuals. The kit has no
+ * dedicated curve/bend piece, so bends are built procedurally in roads.ts to match. */
 export async function loadAssets(): Promise<AssetLibrary> {
   const base = import.meta.env.BASE_URL;
-  const [carScene, ramp] = await Promise.all([
+  const [carScene, straight, crossroad, ramp] = await Promise.all([
     loadGltf(`${base}assets/car/sedan.glb`),
+    loadGltf(`${base}assets/road/road-straight.glb`),
+    loadGltf(`${base}assets/road/road-crossroad.glb`),
     loadGltf(`${base}assets/road/road-slant-high.glb`),
   ]);
-  return { carScene, road: { ramp } };
+  return { carScene, road: { straight, crossroad, ramp } };
 }
