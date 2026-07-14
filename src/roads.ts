@@ -10,6 +10,19 @@ const CURB_THICKNESS = 0.25;
 // Height the pavement decal sits above the (now flattened-flush) terrain, purely
 // to avoid z-fighting with the ground mesh underneath it.
 const DECAL_HEIGHT = 0.08;
+// Max grade a single straight tile will climb (~13°); a bigger gap between two
+// connected points gets climbed gradually over consecutive tiles instead. Kept
+// gentler than terrain's own natural slope cap so a fast-moving car reliably
+// keeps traction through a climb instead of catching air off a steep grade change.
+const MAX_GRADE_PITCH = 0.22;
+
+/** Grading info for a straight tile climbing/descending a slope; junctions stay flat (null). */
+interface SlopeInfo {
+  axisIsZ: boolean;
+  pitch: number; // radians, matches THREE's rotation.x convention for the road mesh
+  loHeight: number; // height at the tile's "low" edge (S for a N/S run, W for an E/W run)
+  hiHeight: number; // height at the tile's "high" edge (N for a N/S run, E for an E/W run)
+}
 
 export const RoadKind = {
   Standard: "standard",
@@ -71,6 +84,7 @@ class RoadTile {
   private readonly RAPIER: Rapier;
   private readonly centerHeight: number;
   private readonly roadAssets: RoadAssets;
+  private readonly slope: SlopeInfo | null;
   /** For ramps: the direction (index into DIRS) the ramp launches towards. */
   readonly facing: number;
 
@@ -82,6 +96,7 @@ class RoadTile {
     centerHeight: number,
     facing: number,
     roadAssets: RoadAssets,
+    slope: SlopeInfo | null,
   ) {
     this.RAPIER = RAPIER;
     this.world = world;
@@ -90,15 +105,25 @@ class RoadTile {
     this.centerHeight = centerHeight;
     this.facing = facing;
     this.roadAssets = roadAssets;
+    this.slope = slope;
   }
 
-  /** Rebuild the road surface shape and the perpendicular curb walls to match current neighbors. */
-  updateConnections(connectedMask: boolean[]): void {
+  /**
+   * Rebuild the road surface shape and the perpendicular curb walls. `shapeMask`
+   * (real placed tiles only) drives which piece is used, so a tile's shape
+   * only ever reflects actual pavement it connects to; `curbMask` (also aware
+   * of the spawn/target network endpoints) drives which sides get walled off,
+   * so the first/last tile leading to the (unpaved) spawn/target point still
+   * stays open there. Using curbMask for the shape too would make a tile's
+   * rendered shape flicker between straight/curve/junction depending on
+   * where the target marker (which moves every round) happens to wander.
+   */
+  updateConnections(curbMask: boolean[], shapeMask: boolean[]): void {
     if (this.roadMesh) {
       this.group.remove(this.roadMesh);
       disposeObject3D(this.roadMesh);
     }
-    this.roadMesh = buildTileMesh(this.kind, this.facing, connectedMask, this.roadAssets);
+    this.roadMesh = buildTileMesh(this.kind, this.facing, shapeMask, this.roadAssets, this.cell, this.slope?.pitch ?? 0);
     this.group.add(this.roadMesh);
 
     for (const body of this.curbBodies) this.world.removeRigidBody(body);
@@ -110,7 +135,7 @@ class RoadTile {
 
     const center = cellCenter(this.cell);
     for (let dir = 0; dir < 4; dir++) {
-      if (connectedMask[dir]) continue;
+      if (curbMask[dir]) continue;
       if (this.kind === RoadKind.Ramp && dir === this.facing) continue; // launch end stays open
       if (this.kind === RoadKind.Ramp && dir === (this.facing + 2) % 4) continue; // entry end stays open
       this.addCurb(dir, center);
@@ -119,14 +144,36 @@ class RoadTile {
 
   private addCurb(dir: number, center: THREE.Vector3): void {
     const { dc, dr } = DIRS[dir];
-    const isNS = dc === 0;
+    const isNS = dc === 0; // curb blocks the N or S end (wide in X); false = blocks E/W side (wide in Z)
     const hx = isNS ? TILE_SIZE / 2 : CURB_THICKNESS / 2;
     const hz = isNS ? CURB_THICKNESS / 2 : TILE_SIZE / 2;
     const x = center.x + (dc * TILE_SIZE) / 2;
     const z = center.z + (dr * TILE_SIZE) / 2;
-    const y = this.centerHeight + DECAL_HEIGHT + CURB_HEIGHT / 2;
+
+    // On a sloped straight tile, the two curbs running parallel to the travel
+    // axis (its sides) are tilted to match the road surface instead of
+    // floating above the low end or burying into the high end; the two
+    // perpendicular end-cap curbs (when unconnected) sit flat at their own
+    // edge's actual height instead of the tile's mid-slope average.
+    let y = this.centerHeight + DECAL_HEIGHT + CURB_HEIGHT / 2;
+    let tiltX = 0;
+    let tiltZ = 0;
+    if (this.slope) {
+      const isParallelSide = this.slope.axisIsZ ? !isNS : isNS;
+      if (isParallelSide) {
+        tiltX = this.slope.axisIsZ ? this.slope.pitch : 0;
+        tiltZ = this.slope.axisIsZ ? 0 : -this.slope.pitch;
+      } else {
+        const loDir = this.slope.axisIsZ ? 2 : 3;
+        y = (dir === loDir ? this.slope.loHeight : this.slope.hiHeight) + DECAL_HEIGHT + CURB_HEIGHT / 2;
+      }
+    }
 
     const bodyDesc = this.RAPIER.RigidBodyDesc.fixed().setTranslation(x, y, z);
+    if (tiltX !== 0 || tiltZ !== 0) {
+      const q = new THREE.Quaternion().setFromEuler(new THREE.Euler(tiltX, 0, tiltZ));
+      bodyDesc.setRotation({ x: q.x, y: q.y, z: q.z, w: q.w });
+    }
     const body = this.world.createRigidBody(bodyDesc);
     const colliderDesc = this.RAPIER.ColliderDesc.cuboid(hx, CURB_HEIGHT / 2, hz).setFriction(0.9);
     this.world.createCollider(colliderDesc, body);
@@ -136,7 +183,8 @@ class RoadTile {
       new THREE.BoxGeometry(hx * 2, CURB_HEIGHT, hz * 2),
       new THREE.MeshStandardMaterial({ color: 0x9a9a9a, roughness: 0.8 }),
     );
-    mesh.position.set(x - center.x, CURB_HEIGHT / 2 + DECAL_HEIGHT, z - center.z);
+    mesh.position.set(x - center.x, y - this.centerHeight, z - center.z);
+    mesh.rotation.set(tiltX, 0, tiltZ);
     mesh.castShadow = true;
     this.group.add(mesh);
     this.curbMeshes.push(mesh);
@@ -194,10 +242,23 @@ const TILE_TARGET_COLOR: Record<RoadKind, number> = {
 };
 
 /** Clones a Kenney road template and recolors it via the gamma-correct tint multiplier. */
-function buildKenneyMesh(template: THREE.Object3D, rotationY: number, kind: RoadKind, swatchLinear: number[]): THREE.Object3D {
+function buildKenneyMesh(
+  template: THREE.Object3D,
+  rotationY: number,
+  kind: RoadKind,
+  swatchLinear: number[],
+  pitch = 0,
+): THREE.Object3D {
   const mesh = template.clone(true);
   mesh.scale.setScalar(TILE_SIZE);
-  mesh.rotation.set(0, rotationY, 0);
+  // Pitch is applied before yaw (THREE's default XYZ Euler order), so it always
+  // tilts the tile's own native travel axis to match the graded slope regardless
+  // of which world direction the piece ends up facing after the yaw rotation.
+  mesh.rotation.set(pitch, rotationY, 0);
+  // The template's own bottom face sits at local y=0, exactly the flattened terrain's
+  // height — without this clearance the two surfaces z-fight, showing as a fine
+  // flickering/checkered moire pattern where the terrain and road interleave.
+  mesh.position.y = DECAL_HEIGHT;
   const tint = tintMultiplierFor(TILE_TARGET_COLOR[kind], swatchLinear);
   mesh.traverse((obj) => {
     if (!(obj instanceof THREE.Mesh)) return;
@@ -211,9 +272,20 @@ function buildKenneyMesh(template: THREE.Object3D, rotationY: number, kind: Road
   return mesh;
 }
 
-function buildStraightMesh(kind: RoadKind, axisIsZ: boolean, roadAssets: RoadAssets): THREE.Object3D {
+function buildStraightMesh(
+  kind: RoadKind,
+  axisIsZ: boolean,
+  roadAssets: RoadAssets,
+  cell: Cell,
+  pitch: number,
+): THREE.Object3D {
+  // Every third plain "Road" tile (deterministic by position, so it doesn't
+  // flicker between rebuilds) gets Kenney's lightpost variant for a bit of
+  // streetscape variety instead of only ever using the bare straight piece.
+  const useLightposts = kind === RoadKind.Standard && ((cell.col + cell.row * 3) % 3 === 0);
+  const template = useLightposts ? roadAssets.straightLightposts : roadAssets.straight;
   // Straight template runs along local Z (native N/S); rotate 90° for an E/W run.
-  return buildKenneyMesh(roadAssets.straight, axisIsZ ? 0 : Math.PI / 2, kind, CITYBUILDER_SWATCH_LINEAR);
+  return buildKenneyMesh(template, axisIsZ ? 0 : Math.PI / 2, kind, CITYBUILDER_SWATCH_LINEAR, pitch);
 }
 
 function buildPlateMesh(kind: RoadKind, roadAssets: RoadAssets): THREE.Object3D {
@@ -245,7 +317,14 @@ function buildTJunctionMesh(kind: RoadKind, missingDir: number, roadAssets: Road
 }
 
 /** Picks straight / curve / T-junction / crossroad shape from the tile's actual live connectivity. */
-function buildTileMesh(kind: RoadKind, facing: number, mask: boolean[], roadAssets: RoadAssets): THREE.Object3D {
+function buildTileMesh(
+  kind: RoadKind,
+  facing: number,
+  mask: boolean[],
+  roadAssets: RoadAssets,
+  cell: Cell,
+  pitch: number,
+): THREE.Object3D {
   if (kind === RoadKind.Ramp) return buildRampMesh(facing, roadAssets);
   if (kind === RoadKind.Crossroad) return buildPlateMesh(kind, roadAssets);
 
@@ -253,15 +332,15 @@ function buildTileMesh(kind: RoadKind, facing: number, mask: boolean[], roadAsse
   if (dirs.length === 2) {
     const [a, b] = dirs;
     const opposite = (a + 2) % 4 === b;
-    if (opposite) return buildStraightMesh(kind, a % 2 === 0, roadAssets);
+    if (opposite) return buildStraightMesh(kind, a % 2 === 0, roadAssets, cell, pitch);
     return buildCurveMesh(kind, [a, b], roadAssets);
   }
   if (dirs.length === 3) {
     const missingDir = [0, 1, 2, 3].find((d) => !dirs.includes(d))!;
     return buildTJunctionMesh(kind, missingDir, roadAssets);
   }
-  if (dirs.length === 1) return buildStraightMesh(kind, dirs[0] % 2 === 0, roadAssets);
-  if (dirs.length === 0) return buildStraightMesh(kind, true, roadAssets);
+  if (dirs.length === 1) return buildStraightMesh(kind, dirs[0] % 2 === 0, roadAssets, cell, pitch);
+  if (dirs.length === 0) return buildStraightMesh(kind, true, roadAssets, cell, pitch);
   return buildPlateMesh(kind, roadAssets); // 4-way
 }
 
@@ -315,6 +394,12 @@ export class RoadSystem {
     return DIRS.map(({ dc, dr }) => this.isNetworkCell({ col: cell.col + dc, row: cell.row + dr }));
   }
 
+  /** Like connectionMask, but only counts actual placed tiles — never the spawn/target
+   * points, which move every round and shouldn't make an unrelated tile's shape flicker. */
+  private tileConnectionMask(cell: Cell): boolean[] {
+    return DIRS.map(({ dc, dr }) => this.tiles.has(cellKey({ col: cell.col + dc, row: cell.row + dr })));
+  }
+
   /** Which direction (if any) an adjacent network cell lies, for auto-orienting new tiles. */
   private incomingDirection(cell: Cell): number | null {
     for (let dir = 0; dir < 4; dir++) {
@@ -325,13 +410,20 @@ export class RoadSystem {
   }
 
   canPlace(cell: Cell): boolean {
-    if (this.isNetworkCell(cell)) return false;
+    if (this.tiles.has(cellKey(cell))) return false; // already a tile there
     if (Math.abs(cell.col * TILE_SIZE) > this.terrain.worldSize / 2 - TILE_SIZE) return false;
     if (Math.abs(cell.row * TILE_SIZE) > this.terrain.worldSize / 2 - TILE_SIZE) return false;
+    // The spawn/target cells are always valid to pave — they're already part of
+    // the network, they just don't have a tile object (and mesh/curbs/flattened
+    // ground) until the player builds one there.
+    const isEndpoint =
+      (cell.col === this.spawnCell.col && cell.row === this.spawnCell.row) ||
+      (cell.col === this.targetCell.col && cell.row === this.targetCell.row);
+    if (isEndpoint) return true;
     return this.incomingDirection(cell) !== null;
   }
 
-  /** Flat target height for a new tile: the average terrain height at each already-connected edge. */
+  /** Flat target height for a new junction tile: the average terrain height at each already-connected edge. */
   private computeFlatHeight(cell: Cell, mask: boolean[]): number {
     const center = cellCenter(cell);
     const heights: number[] = [];
@@ -344,20 +436,74 @@ export class RoadSystem {
     return heights.reduce((a, b) => a + b, 0) / heights.length;
   }
 
+  /**
+   * For a tile that will render as a straight piece (one real-tile connection,
+   * or two opposite), grades it as a ramp from its low edge's actual terrain
+   * height to its high edge's, capped to MAX_GRADE_PITCH — a bigger gap gets
+   * climbed gradually by consecutive tiles instead of a single steep one, and
+   * a cliff-like connection just steps once at the tile boundary rather than
+   * clipping. Junction shapes (bends/T/4-way) return null and stay flat —
+   * tilting a multi-directional piece convincingly isn't worth the complexity.
+   */
+  private computeSlope(cell: Cell, shapeMask: boolean[]): SlopeInfo | null {
+    const dirs = [0, 1, 2, 3].filter((d) => shapeMask[d]);
+    let axisIsZ: boolean;
+    if (dirs.length === 1) {
+      axisIsZ = dirs[0] % 2 === 0;
+    } else if (dirs.length === 2 && (dirs[0] + 2) % 4 === dirs[1]) {
+      axisIsZ = dirs[0] % 2 === 0;
+    } else {
+      return null;
+    }
+
+    const center = cellCenter(cell);
+    const loDir = axisIsZ ? 2 : 3;
+    const hiDir = axisIsZ ? 0 : 1;
+    const lo = this.terrain.getHeightAt(
+      center.x + (DIRS[loDir].dc * TILE_SIZE) / 2,
+      center.z + (DIRS[loDir].dr * TILE_SIZE) / 2,
+    );
+    const rawHi = this.terrain.getHeightAt(
+      center.x + (DIRS[hiDir].dc * TILE_SIZE) / 2,
+      center.z + (DIRS[hiDir].dr * TILE_SIZE) / 2,
+    );
+    const maxDelta = TILE_SIZE * Math.tan(MAX_GRADE_PITCH);
+    const hi = lo + THREE.MathUtils.clamp(rawHi - lo, -maxDelta, maxDelta);
+    const pitch = Math.atan2(lo - hi, TILE_SIZE);
+    return { axisIsZ, pitch, loHeight: lo, hiHeight: hi };
+  }
+
   place(cell: Cell, kind: RoadKind): boolean {
     if (!this.canPlace(cell)) return false;
-    const incoming = this.incomingDirection(cell)!;
+    // Placing directly on the spawn/target cell (before anything else connects to
+    // it) has no incoming neighbor to orient from; default to facing south.
+    const incoming = this.incomingDirection(cell) ?? 0;
     const facing = (incoming + 2) % 4; // ramp launches away from the connected neighbor
     const mask = this.connectionMask(cell);
-
-    // Grade the ground flat under the tile first so the pavement and its
-    // physics both sit flush with the (now-levelled) terrain underneath.
-    const flatHeight = this.computeFlatHeight(cell, mask);
     const center = cellCenter(cell);
-    this.terrain.flattenForRoad(center.x, center.z, TILE_SIZE / 2, flatHeight);
+
+    // Grade the ground under the tile first so the pavement and its physics
+    // both sit flush with the (now-levelled or ramped) terrain underneath.
+    // Ramp/Crossroad kinds always render as their own fixed (unpitched) mesh
+    // regardless of shape, so grading them to a slope would leave their
+    // visual + physics tilt mismatched against the now-sloped ground.
+    const canSlope = kind !== RoadKind.Ramp && kind !== RoadKind.Crossroad;
+    const slope = canSlope ? this.computeSlope(cell, this.tileConnectionMask(cell)) : null;
+    let flatHeight: number;
+    if (slope) {
+      const { axisIsZ, loHeight, hiHeight } = slope;
+      this.terrain.flattenForRoad(center.x, center.z, TILE_SIZE / 2, (x, z) => {
+        const t = axisIsZ ? (z - center.z) / (TILE_SIZE / 2) : (x - center.x) / (TILE_SIZE / 2);
+        return THREE.MathUtils.lerp(loHeight, hiHeight, (THREE.MathUtils.clamp(t, -1, 1) + 1) / 2);
+      });
+      flatHeight = (loHeight + hiHeight) / 2;
+    } else {
+      flatHeight = this.computeFlatHeight(cell, mask);
+      this.terrain.flattenForRoad(center.x, center.z, TILE_SIZE / 2, () => flatHeight);
+    }
     center.y = flatHeight;
 
-    const tile = new RoadTile(this.RAPIER, this.world, cell, kind, center.y, facing, this.roadAssets);
+    const tile = new RoadTile(this.RAPIER, this.world, cell, kind, center.y, facing, this.roadAssets, slope);
     tile.group.position.copy(center);
     this.root.add(tile.group);
 
@@ -391,7 +537,7 @@ export class RoadSystem {
   private refreshCurbs(cell: Cell): void {
     const tile = this.tiles.get(cellKey(cell));
     if (!tile) return;
-    tile.updateConnections(this.connectionMask(cell));
+    tile.updateConnections(this.connectionMask(cell), this.tileConnectionMask(cell));
   }
 
   /**

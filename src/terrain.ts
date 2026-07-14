@@ -157,12 +157,14 @@ export class Terrain {
   }
 
   /**
-   * Grades the ground under a road tile flat at `height` so the pavement
-   * never floats above or clips through sloped terrain, then softens a
-   * one-ring margin around it into an embankment instead of a hard cliff.
-   * Rebuilds both the visual mesh and the physics heightfield to match.
+   * Grades the ground under a road tile to match `heightAt` (a flat constant
+   * for junction pieces, or a linear ramp along the travel axis for a sloped
+   * straight run) so the pavement never floats above or clips through the
+   * terrain, then softens a one-ring margin around it into an embankment
+   * instead of a hard cliff. Rebuilds both the visual mesh and the physics
+   * heightfield to match.
    */
-  flattenForRoad(centerX: number, centerZ: number, halfSize: number, height: number): void {
+  flattenForRoad(centerX: number, centerZ: number, halfSize: number, heightAt: (x: number, z: number) => number): void {
     const { ix: cix, iy: ciy } = worldToGrid(centerX, centerZ);
     const coreRadius = Math.max(1, Math.round(halfSize / SPACING));
     const marginRadius = coreRadius + 1;
@@ -172,11 +174,14 @@ export class Terrain {
         const iy = ciy + dy;
         if (ix < 0 || ix >= GRID || iy < 0 || iy >= GRID) continue;
         const i = idx(iy, ix);
+        const worldX = -TERRAIN_SIZE / 2 + ix * SPACING;
+        const worldZ = -TERRAIN_SIZE / 2 + iy * SPACING;
+        const target = heightAt(worldX, worldZ);
         const chebyshev = Math.max(Math.abs(dx), Math.abs(dy));
         if (chebyshev <= coreRadius) {
-          this.heights[i] = height;
+          this.heights[i] = target;
         } else {
-          this.heights[i] = THREE.MathUtils.lerp(this.heights[i], height, 0.35);
+          this.heights[i] = THREE.MathUtils.lerp(this.heights[i], target, 0.35);
         }
       }
     }

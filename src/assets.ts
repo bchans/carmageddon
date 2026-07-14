@@ -3,6 +3,7 @@ import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 
 export interface RoadAssets {
   straight: THREE.Object3D;
+  straightLightposts: THREE.Object3D;
   curve: THREE.Object3D;
   tJunction: THREE.Object3D;
   crossroad: THREE.Object3D;
@@ -35,13 +36,14 @@ function loadGltf(url: string): Promise<THREE.Object3D> {
  */
 export async function loadAssets(): Promise<AssetLibrary> {
   const base = import.meta.env.BASE_URL;
-  const [carScene, straight, curve, tJunction, crossroad, ramp] = await Promise.all([
+  const [carScene, straight, straightLightposts, curve, tJunction, crossroad, ramp] = await Promise.all([
     loadGltf(`${base}assets/car/sedan.glb`),
     loadGltf(`${base}assets/road/citybuilder/road-straight.glb`),
+    loadGltf(`${base}assets/road/citybuilder/road-straight-lightposts.glb`),
     loadGltf(`${base}assets/road/citybuilder/road-corner.glb`),
     loadGltf(`${base}assets/road/citybuilder/road-split.glb`),
     loadGltf(`${base}assets/road/citybuilder/road-intersection.glb`),
     loadGltf(`${base}assets/road/road-slant-high.glb`),
   ]);
-  return { carScene, road: { straight, curve, tJunction, crossroad, ramp } };
+  return { carScene, road: { straight, straightLightposts, curve, tJunction, crossroad, ramp } };
 }
