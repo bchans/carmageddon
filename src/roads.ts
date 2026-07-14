@@ -82,9 +82,9 @@ class RoadTile {
   private roadMesh: THREE.Object3D | null = null;
   private readonly world: RAPIER.World;
   private readonly RAPIER: Rapier;
-  private readonly centerHeight: number;
+  private centerHeight: number;
   private readonly roadAssets: RoadAssets;
-  private readonly slope: SlopeInfo | null;
+  private slope: SlopeInfo | null;
   /** For ramps: the direction (index into DIRS) the ramp launches towards. */
   readonly facing: number;
 
@@ -106,6 +106,21 @@ class RoadTile {
     this.facing = facing;
     this.roadAssets = roadAssets;
     this.slope = slope;
+  }
+
+  /**
+   * Re-grades this tile to a newly computed pad height/slope (see
+   * `RoadSystem.gradeCell`) and repositions its group accordingly. Needed
+   * because a tile's rendered shape can change after it's placed — e.g. a
+   * graded straight run turns into a flat T-junction/crossroad plate once a
+   * new neighbor connects on a third or fourth side — and the terrain under
+   * it has to be re-flattened to match, not left however it was graded for
+   * the tile's shape at the time it was first placed.
+   */
+  applyGrade(centerHeight: number, slope: SlopeInfo | null): void {
+    this.centerHeight = centerHeight;
+    this.slope = slope;
+    this.group.position.y = centerHeight;
   }
 
   /**
@@ -475,22 +490,18 @@ export class RoadSystem {
     return { axisIsZ, pitch, loHeight: lo, hiHeight: hi };
   }
 
-  place(cell: Cell, kind: RoadKind): boolean {
-    if (!this.canPlace(cell)) return false;
-    // Placing directly on the spawn/target cell (before anything else connects to
-    // it) has no incoming neighbor to orient from; default to facing south.
-    const incoming = this.incomingDirection(cell) ?? 0;
-    const facing = (incoming + 2) % 4; // ramp launches away from the connected neighbor
-    const mask = this.connectionMask(cell);
-    const center = cellCenter(cell);
-
-    // Grade the ground under the tile first so the pavement and its physics
-    // both sit flush with the (now-levelled or ramped) terrain underneath.
-    // Ramp/Crossroad kinds always render as their own fixed (unpitched) mesh
-    // regardless of shape, so grading them to a slope would leave their
-    // visual + physics tilt mismatched against the now-sloped ground.
+  /**
+   * Grades the ground under a cell so the pavement and its physics both sit
+   * flush with the (now-levelled or ramped) terrain underneath, and returns
+   * the resulting pad height/slope. Ramp/Crossroad kinds always render as
+   * their own fixed (unpitched) mesh regardless of shape, so grading them to
+   * a slope would leave their visual + physics tilt mismatched against the
+   * now-sloped ground.
+   */
+  private gradeCell(cell: Cell, kind: RoadKind): { flatHeight: number; slope: SlopeInfo | null } {
     const canSlope = kind !== RoadKind.Ramp && kind !== RoadKind.Crossroad;
     const slope = canSlope ? this.computeSlope(cell, this.tileConnectionMask(cell)) : null;
+    const center = cellCenter(cell);
     let flatHeight: number;
     if (slope) {
       const { axisIsZ, loHeight, hiHeight } = slope;
@@ -500,9 +511,21 @@ export class RoadSystem {
       });
       flatHeight = (loHeight + hiHeight) / 2;
     } else {
-      flatHeight = this.computeFlatHeight(cell, mask);
+      flatHeight = this.computeFlatHeight(cell, this.connectionMask(cell));
       this.terrain.flattenForRoad(center.x, center.z, TILE_SIZE / 2, () => flatHeight);
     }
+    return { flatHeight, slope };
+  }
+
+  place(cell: Cell, kind: RoadKind): boolean {
+    if (!this.canPlace(cell)) return false;
+    // Placing directly on the spawn/target cell (before anything else connects to
+    // it) has no incoming neighbor to orient from; default to facing south.
+    const incoming = this.incomingDirection(cell) ?? 0;
+    const facing = (incoming + 2) % 4; // ramp launches away from the connected neighbor
+
+    const { flatHeight, slope } = this.gradeCell(cell, kind);
+    const center = cellCenter(cell);
     center.y = flatHeight;
 
     const tile = new RoadTile(this.RAPIER, this.world, cell, kind, center.y, facing, this.roadAssets, slope);
@@ -522,7 +545,13 @@ export class RoadSystem {
       const c = Math.cos(half);
       bodyDesc.setRotation({ x: rotAxis.x * s, y: rotAxis.y * s, z: rotAxis.z * s, w: c });
       const body = this.world.createRigidBody(bodyDesc);
-      const colliderDesc = this.RAPIER.ColliderDesc.cuboid(TILE_SIZE / 2, DECAL_HEIGHT / 2, TILE_SIZE * 0.75).setFriction(1.1);
+      // The collider's long half-extent (3, i.e. 6 units) always has to run along
+      // whichever local axis the tilt rotation above actually pitches — Z for a
+      // N/S ramp (rotated around X), X for an E/W ramp (rotated around Z). Using
+      // the same (2, 3) ordering for every facing left E/W ramps with a launch
+      // surface only 4 units long across the direction of travel instead of 6.
+      const [hx, hz] = facing % 2 === 0 ? [TILE_SIZE / 2, TILE_SIZE * 0.75] : [TILE_SIZE * 0.75, TILE_SIZE / 2];
+      const colliderDesc = this.RAPIER.ColliderDesc.cuboid(hx, DECAL_HEIGHT / 2, hz).setFriction(1.1);
       this.world.createCollider(colliderDesc, body);
     }
     this.tiles.set(cellKey(cell), tile);
@@ -539,6 +568,16 @@ export class RoadSystem {
   private refreshCurbs(cell: Cell): void {
     const tile = this.tiles.get(cellKey(cell));
     if (!tile) return;
+    // A newly-placed neighbor can change this tile's own rendered shape (e.g.
+    // straight -> curve/T/crossroad plate as a third or fourth side connects),
+    // which changes whether it should be flat or sloped — re-grade the ground
+    // under it to match before rebuilding the mesh/curbs, not just once at the
+    // tile's original placement. Ramp/Crossroad kind pieces always render as
+    // their own fixed asset regardless of shape, so their pad is left as-is.
+    if (tile.kind !== RoadKind.Ramp && tile.kind !== RoadKind.Crossroad) {
+      const { flatHeight, slope } = this.gradeCell(cell, tile.kind);
+      tile.applyGrade(flatHeight, slope);
+    }
     tile.updateConnections(this.connectionMask(cell), this.tileConnectionMask(cell));
   }
 
