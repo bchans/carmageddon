@@ -31,10 +31,14 @@ export class Terrain {
   readonly isRiver: Uint8Array;
   readonly mesh: THREE.Mesh;
   readonly waterMesh: THREE.Mesh;
-  readonly collider: RAPIER.Collider;
   readonly rigidBody: RAPIER.RigidBody;
+  private collider: RAPIER.Collider;
+  private readonly RAPIER: Rapier;
+  private readonly world: RAPIER.World;
 
   private constructor(
+    RAPIER: Rapier,
+    world: RAPIER.World,
     heights: Float32Array,
     isRiver: Uint8Array,
     mesh: THREE.Mesh,
@@ -42,6 +46,8 @@ export class Terrain {
     rigidBody: RAPIER.RigidBody,
     collider: RAPIER.Collider,
   ) {
+    this.RAPIER = RAPIER;
+    this.world = world;
     this.heights = heights;
     this.isRiver = isRiver;
     this.mesh = mesh;
@@ -108,7 +114,7 @@ export class Terrain {
     ).setFriction(1.0);
     const collider = world.createCollider(colliderDesc, rigidBody);
 
-    return new Terrain(heights, isRiver, mesh, waterMesh, rigidBody, collider);
+    return new Terrain(RAPIER, world, heights, isRiver, mesh, waterMesh, rigidBody, collider);
   }
 
   /** Bilinear-interpolated terrain height at a world-space (x, z) coordinate. */
@@ -148,6 +154,75 @@ export class Terrain {
 
   get worldSize(): number {
     return TERRAIN_SIZE;
+  }
+
+  /**
+   * Grades the ground under a road tile flat at `height` so the pavement
+   * never floats above or clips through sloped terrain, then softens a
+   * one-ring margin around it into an embankment instead of a hard cliff.
+   * Rebuilds both the visual mesh and the physics heightfield to match.
+   */
+  flattenForRoad(centerX: number, centerZ: number, halfSize: number, height: number): void {
+    const { ix: cix, iy: ciy } = worldToGrid(centerX, centerZ);
+    const coreRadius = Math.max(1, Math.round(halfSize / SPACING));
+    const marginRadius = coreRadius + 1;
+    for (let dy = -marginRadius; dy <= marginRadius; dy++) {
+      for (let dx = -marginRadius; dx <= marginRadius; dx++) {
+        const ix = cix + dx;
+        const iy = ciy + dy;
+        if (ix < 0 || ix >= GRID || iy < 0 || iy >= GRID) continue;
+        const i = idx(iy, ix);
+        const chebyshev = Math.max(Math.abs(dx), Math.abs(dy));
+        if (chebyshev <= coreRadius) {
+          this.heights[i] = height;
+        } else {
+          this.heights[i] = THREE.MathUtils.lerp(this.heights[i], height, 0.35);
+        }
+      }
+    }
+    this.rebuildMeshFromHeights();
+    this.rebuildCollider();
+  }
+
+  private rebuildMeshFromHeights(): void {
+    const position = this.mesh.geometry.attributes.position as THREE.BufferAttribute;
+    const colorAttr = this.mesh.geometry.attributes.color as THREE.BufferAttribute;
+    const hs = [0, 0, 0];
+    for (let tri = 0; tri < position.count; tri += 3) {
+      let hSum = 0;
+      let riverAny = false;
+      for (let k = 0; k < 3; k++) {
+        const { ix, iy } = worldToGrid(position.getX(tri + k), position.getZ(tri + k));
+        const i = idx(iy, ix);
+        hs[k] = this.heights[i];
+        hSum += hs[k];
+        if (this.isRiver[i]) riverAny = true;
+      }
+      for (let k = 0; k < 3; k++) position.setY(tri + k, hs[k]);
+      const c = colorForHeight(hSum / 3, riverAny);
+      for (let k = 0; k < 3; k++) colorAttr.setXYZ(tri + k, c.r, c.g, c.b);
+    }
+    position.needsUpdate = true;
+    colorAttr.needsUpdate = true;
+    this.mesh.geometry.computeVertexNormals();
+    this.mesh.geometry.computeBoundingSphere();
+  }
+
+  private rebuildCollider(): void {
+    this.world.removeCollider(this.collider, true);
+    const colliderHeights = new Float32Array(GRID * GRID);
+    for (let iy = 0; iy < GRID; iy++) {
+      for (let ix = 0; ix < GRID; ix++) {
+        colliderHeights[ix * GRID + iy] = this.heights[idx(iy, ix)];
+      }
+    }
+    const colliderDesc = this.RAPIER.ColliderDesc.heightfield(
+      TERRAIN_SEGMENTS,
+      TERRAIN_SEGMENTS,
+      colliderHeights,
+      { x: TERRAIN_SIZE, y: 1, z: TERRAIN_SIZE },
+    ).setFriction(1.0);
+    this.collider = this.world.createCollider(colliderDesc, this.rigidBody);
   }
 }
 

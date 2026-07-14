@@ -4,6 +4,8 @@ export const MIN_ZOOM = 0.5;
 export const MAX_ZOOM = 2.4;
 const TAP_MOVE_THRESHOLD = 6; // px
 const PAN_SPEED = 0.0016; // world units per screen px per zoom unit
+const KEY_PAN_SPEED = 24; // world units per second at zoom 1, for WASD/arrow-key panning
+const PAN_KEYS = new Set(["w", "a", "s", "d", "arrowup", "arrowdown", "arrowleft", "arrowright"]);
 
 export interface CameraControllerCallbacks {
   onTap: (clientX: number, clientY: number) => void;
@@ -23,6 +25,7 @@ export class CameraController {
   private dragMoved = false;
   private pinchStartDist = 0;
   private pinchStartZoom = 1;
+  private readonly pressedKeys = new Set<string>();
   private readonly domElement: HTMLElement;
   private readonly callbacks: CameraControllerCallbacks;
 
@@ -33,6 +36,35 @@ export class CameraController {
     domElement.addEventListener("pointermove", this.onPointerMove);
     window.addEventListener("pointerup", this.onPointerUp);
     domElement.addEventListener("wheel", this.onWheel, { passive: false });
+    window.addEventListener("keydown", this.onKeyDown);
+    window.addEventListener("keyup", this.onKeyUp);
+  }
+
+  private onKeyDown = (e: KeyboardEvent): void => {
+    const key = e.key.toLowerCase();
+    if (!PAN_KEYS.has(key)) return;
+    this.pressedKeys.add(key);
+    e.preventDefault();
+  };
+
+  private onKeyUp = (e: KeyboardEvent): void => {
+    this.pressedKeys.delete(e.key.toLowerCase());
+  };
+
+  /** Moves panOffset from held WASD/arrow keys; call once per rendered frame. */
+  update(dt: number): void {
+    if (this.pressedKeys.size === 0) return;
+    let dx = 0;
+    let dz = 0;
+    if (this.pressedKeys.has("w") || this.pressedKeys.has("arrowup")) dz -= 1;
+    if (this.pressedKeys.has("s") || this.pressedKeys.has("arrowdown")) dz += 1;
+    if (this.pressedKeys.has("a") || this.pressedKeys.has("arrowleft")) dx -= 1;
+    if (this.pressedKeys.has("d") || this.pressedKeys.has("arrowright")) dx += 1;
+    if (dx === 0 && dz === 0) return;
+    const len = Math.hypot(dx, dz);
+    const speed = (KEY_PAN_SPEED / this.zoom) * dt;
+    this.panOffset.x += (dx / len) * speed;
+    this.panOffset.y += (dz / len) * speed;
   }
 
   private onPointerDown = (e: PointerEvent): void => {
@@ -98,6 +130,8 @@ export class CameraController {
     this.domElement.removeEventListener("pointermove", this.onPointerMove);
     window.removeEventListener("pointerup", this.onPointerUp);
     this.domElement.removeEventListener("wheel", this.onWheel);
+    window.removeEventListener("keydown", this.onKeyDown);
+    window.removeEventListener("keyup", this.onKeyUp);
   }
 }
 

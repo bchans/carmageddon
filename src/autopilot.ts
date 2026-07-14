@@ -3,8 +3,12 @@ import type { CarInput } from "./car";
 import { MAX_STEER, WHEELBASE } from "./car";
 import { TILE_SIZE } from "./roads";
 
-const ARRIVE_RADIUS = TILE_SIZE * 1.2;
-const FINAL_ARRIVE_RADIUS = TILE_SIZE * 0.7;
+// Small enough that the closely-spaced points sampled along a road curve
+// (see RoadSystem.sampleBendPoints) get consumed one at a time instead of
+// several at once, so the car actually tracks the arc through a bend
+// instead of cutting straight across the tile.
+const ARRIVE_RADIUS = TILE_SIZE * 0.35;
+const FINAL_ARRIVE_RADIUS = TILE_SIZE * 0.45;
 
 /**
  * Drives the car itself along a precomputed list of world-space waypoints —

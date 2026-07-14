@@ -270,6 +270,7 @@ export class Game {
       this.stepPhysics(FIXED_DT);
       this.accumulator -= FIXED_DT;
     }
+    this.cameraController.update(dt);
     this.updateCamera();
     this.renderer.render(this.scene, this.camera);
   };
