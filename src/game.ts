@@ -153,19 +153,28 @@ export class Game {
     this.scene.fog = new THREE.Fog(0x8fc7ff, 120, 260);
   }
 
+  /**
+   * Snaps a coordinate to the road grid (multiples of TILE_SIZE) so a picked
+   * point always lands exactly on a tile center — matching where the road
+   * network's cellWorldCenter() will place things, so the car doesn't spawn
+   * straddling a tile edge/curb where it can catch and get stuck.
+   */
+  private snapToGrid(v: number): number {
+    return Math.round(v / TILE_SIZE) * TILE_SIZE;
+  }
+
   /** Picks a valid (dry, not-too-steep) point along the -X or +X edge of the map. */
   private pickEdgePoint(side: -1 | 1): THREE.Vector3 {
     const half = this.terrain.worldSize / 2 - SPAWN_MARGIN;
+    const x = this.snapToGrid(side * half);
     for (let attempt = 0; attempt < 60; attempt++) {
-      const x = side * half;
-      const z = (this.rng() * 2 - 1) * half;
+      const z = this.snapToGrid((this.rng() * 2 - 1) * half);
       if (this.terrain.isUnderwaterAt(x, z)) continue;
       if (this.terrain.getSlopeAt(x, z) > 0.9) continue;
       const p = new THREE.Vector3(x, 0, z);
       p.y = this.terrain.getHeightAt(x, z);
       return p;
     }
-    const x = side * half;
     const p = new THREE.Vector3(x, 0, 0);
     p.y = this.terrain.getHeightAt(x, 0);
     return p;
@@ -184,8 +193,8 @@ export class Game {
     for (let attempt = 0; attempt < 80; attempt++) {
       const angle = this.rng() * Math.PI * 2;
       const dist = targetDist * (0.75 + this.rng() * 0.25);
-      const x = THREE.MathUtils.clamp(this.spawnWorld.x + Math.cos(angle) * dist, -half, half);
-      const z = THREE.MathUtils.clamp(this.spawnWorld.z + Math.sin(angle) * dist, -half, half);
+      const x = this.snapToGrid(THREE.MathUtils.clamp(this.spawnWorld.x + Math.cos(angle) * dist, -half, half));
+      const z = this.snapToGrid(THREE.MathUtils.clamp(this.spawnWorld.z + Math.sin(angle) * dist, -half, half));
       if (Math.hypot(x - this.spawnWorld.x, z - this.spawnWorld.z) < MIN_TARGET_DIST * 0.6) continue;
       if (this.terrain.isUnderwaterAt(x, z)) continue;
       if (this.terrain.getSlopeAt(x, z) > 0.9) continue;

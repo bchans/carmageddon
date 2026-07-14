@@ -192,7 +192,9 @@ export class Car {
       const desiredSpeed = input.throttle * MAX_SPEED * forceMultiplier;
       const desired = forward.multiplyScalar(desiredSpeed);
       const vel = this.chassisBody.linvel();
-      const velBlend = Math.min(1, dt * 3.5);
+      // Snaps velocity onto the rotated heading quickly enough that momentum
+      // doesn't carry the car wide through a tight road bend and into a curb.
+      const velBlend = Math.min(1, dt * 6);
       this.chassisBody.setLinvel(
         {
           x: THREE.MathUtils.lerp(vel.x, desired.x, velBlend),

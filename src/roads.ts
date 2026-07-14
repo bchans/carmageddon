@@ -33,6 +33,12 @@ export interface Cell {
   row: number;
 }
 
+export interface Waypoint {
+  position: THREE.Vector3;
+  /** True for points on/approaching a bend's curve, so the autopilot slows and drops boost ahead of the turn instead of only reacting once already inside it. */
+  slow: boolean;
+}
+
 const DIRS: Array<{ dc: number; dr: number }> = [
   { dc: 0, dr: 1 }, // N
   { dc: 1, dr: 0 }, // E
@@ -153,30 +159,30 @@ function disposeObject3D(obj: THREE.Object3D): void {
 
 // --- Road surfaces ---------------------------------------------------------
 //
-// Straight runs and 3-/4-way junctions reuse Kenney's actual city-kit-roads
-// meshes (real geometry: curb bevels, corner accents, lane dashes). Kenney's
-// kit has no dedicated curve/bend piece though, so bends fall back to a
-// procedurally-built quarter-annulus strip, colored to match.
+// All road shapes — straight, curve, T-junction, and 4-way crossroad — reuse
+// Kenney's actual GLB meshes (real geometry: curb bevels, corner accents,
+// lane dashes) from github.com/KenneyNL/Starter-Kit-City-Builder, the one
+// Kenney kit set that includes a proper curve/corner and T/split piece (the
+// older city-kit-roads pack bundled alongside it for the ramp does not).
 //
 // Kenney's shared atlas swatch that these pieces sample reads as a dark
-// slate-navy (~rgb(84,88,105) — measured directly off the rendered mesh
-// under neutral lighting, not a color-space bug), not the light grey/white
-// asphalt the game wants. TINT_MULTIPLIER recolors it: material.color
-// multiplies the mapped texture in the renderer's linear working space, so
-// the multiplier is derived by converting both the measured swatch and the
-// desired target through the sRGB transfer function rather than guessing a
-// flat replacement color (which would just crush the lane-line contrast).
+// slate-navy under neutral lighting (measured directly off the rendered
+// mesh, not a color-space bug), not the light grey/white asphalt the game
+// wants. tintMultiplierFor recolors it: material.color multiplies the mapped
+// texture in the renderer's linear working space, so the multiplier is
+// derived by converting both the measured swatch and the desired target
+// through the sRGB transfer function rather than guessing a flat replacement
+// color (which would just crush the lane-line contrast).
 function srgbToLinear(c: number): number {
   return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
 }
-const ATLAS_ROAD_SWATCH_LINEAR = [84 / 255, 88 / 255, 105 / 255].map(srgbToLinear);
-function tintMultiplierFor(targetHex: number): THREE.Color {
+// Measured swatch for the city-builder atlas (straight/curve/T/crossroad).
+const CITYBUILDER_SWATCH_LINEAR = [79 / 255, 82 / 255, 96 / 255].map(srgbToLinear);
+// Measured swatch for the older city-kit-roads atlas (ramp only).
+const CITYKIT_SWATCH_LINEAR = [84 / 255, 88 / 255, 105 / 255].map(srgbToLinear);
+function tintMultiplierFor(targetHex: number, swatchLinear: number[]): THREE.Color {
   const target = new THREE.Color(targetHex); // hex ctor converts sRGB -> linear working space
-  return new THREE.Color(
-    target.r / ATLAS_ROAD_SWATCH_LINEAR[0],
-    target.g / ATLAS_ROAD_SWATCH_LINEAR[1],
-    target.b / ATLAS_ROAD_SWATCH_LINEAR[2],
-  );
+  return new THREE.Color(target.r / swatchLinear[0], target.g / swatchLinear[1], target.b / swatchLinear[2]);
 }
 
 const TILE_TARGET_COLOR: Record<RoadKind, number> = {
@@ -188,11 +194,11 @@ const TILE_TARGET_COLOR: Record<RoadKind, number> = {
 };
 
 /** Clones a Kenney road template and recolors it via the gamma-correct tint multiplier. */
-function buildKenneyMesh(template: THREE.Object3D, rotationY: number, kind: RoadKind): THREE.Object3D {
+function buildKenneyMesh(template: THREE.Object3D, rotationY: number, kind: RoadKind, swatchLinear: number[]): THREE.Object3D {
   const mesh = template.clone(true);
   mesh.scale.setScalar(TILE_SIZE);
   mesh.rotation.set(0, rotationY, 0);
-  const tint = tintMultiplierFor(TILE_TARGET_COLOR[kind]);
+  const tint = tintMultiplierFor(TILE_TARGET_COLOR[kind], swatchLinear);
   mesh.traverse((obj) => {
     if (!(obj instanceof THREE.Mesh)) return;
     obj.castShadow = true;
@@ -206,27 +212,39 @@ function buildKenneyMesh(template: THREE.Object3D, rotationY: number, kind: Road
 }
 
 function buildStraightMesh(kind: RoadKind, axisIsZ: boolean, roadAssets: RoadAssets): THREE.Object3D {
-  // Straight template runs along local Z; rotate 90° for an E/W run.
-  return buildKenneyMesh(roadAssets.straight, axisIsZ ? 0 : Math.PI / 2, kind);
+  // Straight template runs along local Z (native N/S); rotate 90° for an E/W run.
+  return buildKenneyMesh(roadAssets.straight, axisIsZ ? 0 : Math.PI / 2, kind, CITYBUILDER_SWATCH_LINEAR);
 }
 
 function buildPlateMesh(kind: RoadKind, roadAssets: RoadAssets): THREE.Object3D {
-  return buildKenneyMesh(roadAssets.crossroad, 0, kind);
+  return buildKenneyMesh(roadAssets.crossroad, 0, kind, CITYBUILDER_SWATCH_LINEAR);
 }
 
 function buildRampMesh(facing: number, roadAssets: RoadAssets): THREE.Object3D {
-  return buildKenneyMesh(roadAssets.ramp, facing * (Math.PI / 2), RoadKind.Ramp);
+  return buildKenneyMesh(roadAssets.ramp, facing * (Math.PI / 2), RoadKind.Ramp, CITYKIT_SWATCH_LINEAR);
 }
 
-/**
- * Picks straight vs. intersection-plate shape from the tile's actual live
- * connectivity. Kenney's kit has no dedicated curve/bend piece, and their
- * straight/crossroad pieces are full-tile-width opaque squares (not a
- * narrower lane strip), so a custom-width procedural curve wouldn't line up
- * with their edges anyway — a bend reuses the crossroad plate instead, which
- * is already a full paved square and joins cleanly with a neighboring
- * straight piece, with curbs closing off the two unused sides.
- */
+// The corner template natively (rotationY = 0) connects dirs {3, 0} (W, N); the
+// T/split template natively connects {3, 0, 1} (W, N, E), i.e. every side but
+// S (dir 2). A rotation of k*90° shifts every connected direction index by k
+// (mod 4) — verified empirically by rendering the piece at each of the 4
+// rotations and sampling which tile edge was pavement vs. grass.
+const CORNER_NATIVE_DIRS: [number, number] = [3, 0];
+const T_JUNCTION_NATIVE_MISSING_DIR = 2;
+
+function buildCurveMesh(kind: RoadKind, dirs: [number, number], roadAssets: RoadAssets): THREE.Object3D {
+  const [a, b] = dirs; // sorted ascending; adjacent pair, either {n, n+1} or the wraparound {0, 3}
+  const nativeStart = a === 0 && b === 3 ? 3 : a;
+  const steps = ((nativeStart - CORNER_NATIVE_DIRS[0]) % 4 + 4) % 4;
+  return buildKenneyMesh(roadAssets.curve, steps * (Math.PI / 2), kind, CITYBUILDER_SWATCH_LINEAR);
+}
+
+function buildTJunctionMesh(kind: RoadKind, missingDir: number, roadAssets: RoadAssets): THREE.Object3D {
+  const steps = ((missingDir - T_JUNCTION_NATIVE_MISSING_DIR) % 4 + 4) % 4;
+  return buildKenneyMesh(roadAssets.tJunction, steps * (Math.PI / 2), kind, CITYBUILDER_SWATCH_LINEAR);
+}
+
+/** Picks straight / curve / T-junction / crossroad shape from the tile's actual live connectivity. */
 function buildTileMesh(kind: RoadKind, facing: number, mask: boolean[], roadAssets: RoadAssets): THREE.Object3D {
   if (kind === RoadKind.Ramp) return buildRampMesh(facing, roadAssets);
   if (kind === RoadKind.Crossroad) return buildPlateMesh(kind, roadAssets);
@@ -236,10 +254,15 @@ function buildTileMesh(kind: RoadKind, facing: number, mask: boolean[], roadAsse
     const [a, b] = dirs;
     const opposite = (a + 2) % 4 === b;
     if (opposite) return buildStraightMesh(kind, a % 2 === 0, roadAssets);
+    return buildCurveMesh(kind, [a, b], roadAssets);
+  }
+  if (dirs.length === 3) {
+    const missingDir = [0, 1, 2, 3].find((d) => !dirs.includes(d))!;
+    return buildTJunctionMesh(kind, missingDir, roadAssets);
   }
   if (dirs.length === 1) return buildStraightMesh(kind, dirs[0] % 2 === 0, roadAssets);
   if (dirs.length === 0) return buildStraightMesh(kind, true, roadAssets);
-  return buildPlateMesh(kind, roadAssets); // bend (2 adjacent), T (3), or 4-way
+  return buildPlateMesh(kind, roadAssets); // 4-way
 }
 
 export class RoadSystem {
@@ -472,25 +495,33 @@ export class RoadSystem {
     return points;
   }
 
-  /** Converts a cell path into world-space waypoints, tracing curves through bends and using exact spawn/target positions at the ends. */
-  buildWaypoints(path: Cell[], spawnWorld: THREE.Vector3, targetWorld: THREE.Vector3): THREE.Vector3[] {
-    const points: THREE.Vector3[] = [];
+  /**
+   * Converts a cell path into world-space waypoints, tracing curves through
+   * bends and using exact spawn/target positions at the ends. Points on a
+   * bend's arc are tagged `slow`, along with the point immediately before
+   * one, so the autopilot starts easing off before it's already mid-turn.
+   */
+  buildWaypoints(path: Cell[], spawnWorld: THREE.Vector3, targetWorld: THREE.Vector3): Waypoint[] {
+    const points: Waypoint[] = [];
     for (let i = 0; i < path.length; i++) {
       if (i === 0) {
-        points.push(spawnWorld.clone());
+        points.push({ position: spawnWorld.clone(), slow: false });
         continue;
       }
       if (i === path.length - 1) {
-        points.push(targetWorld.clone());
+        points.push({ position: targetWorld.clone(), slow: false });
         continue;
       }
       const cell = path[i];
       const dirIn = directionBetween(cell, path[i - 1]);
       const dirOut = directionBetween(cell, path[i + 1]);
       if (dirIn !== null && dirOut !== null) {
-        points.push(...this.sampleBendPoints(cell, dirIn, dirOut));
+        const bendPoints = this.sampleBendPoints(cell, dirIn, dirOut);
+        const isBend = bendPoints.length > 1;
+        if (isBend && points.length > 0) points[points.length - 1].slow = true; // brake before entering the turn
+        for (const position of bendPoints) points.push({ position, slow: isBend });
       } else {
-        points.push(this.cellWorldCenter(cell));
+        points.push({ position: this.cellWorldCenter(cell), slow: false });
       }
     }
     return points;

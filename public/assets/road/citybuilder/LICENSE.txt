@@ -1,0 +1,21 @@
+	City Kit Roads pieces (road-straight, road-corner, road-intersection, road-split)
+
+	Created/distributed by Kenney (www.kenney.nl)
+	Sourced from: https://github.com/KenneyNL/Starter-Kit-City-Builder (models/ directory)
+
+			------------------------------
+
+	License: (Creative Commons Zero, CC0)
+	http://creativecommons.org/publicdomain/zero/1.0/
+
+	Kenney's game assets (models, sprites, audio) in that repository are released
+	under CC0 — the repository's own code is MIT licensed separately.
+
+	You can use this content for personal, educational, and commercial purposes.
+
+	Support by crediting 'Kenney' or 'www.kenney.nl' (this is not a requirement)
+
+			------------------------------
+
+	• Website : www.kenney.nl
+	• Donate  : www.kenney.nl/donate
