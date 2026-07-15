@@ -266,10 +266,15 @@ function buildKenneyMesh(
 ): THREE.Object3D {
   const mesh = template.clone(true);
   mesh.scale.setScalar(TILE_SIZE);
-  // Pitch is applied before yaw (THREE's default XYZ Euler order), so it always
-  // tilts the tile's own native travel axis to match the graded slope regardless
-  // of which world direction the piece ends up facing after the yaw rotation.
-  mesh.rotation.set(pitch, rotationY, 0);
+  // THREE's default 'XYZ' Euler order composes as Rx * Ry * Rz, which — read as a
+  // transform applied to a vector — rotates around Y (yaw) *first* and X (pitch)
+  // *last*, using the fixed world X axis. For an E/W run (rotationY = 90°) that
+  // pitches the already-yawed mesh around world X, which no longer lines up with
+  // its travel axis, tilting it based on tile *width* instead of length (only
+  // invisible for N/S runs, where rotationY is 0 and yaw is a no-op). 'YXZ' order
+  // composes as Ry * Rx * Rz, applying pitch to the untouched template first (always
+  // tilting its native local-Z travel axis) and yaw second, so it works for both.
+  mesh.rotation.set(pitch, rotationY, 0, "YXZ");
   // The template's own bottom face sits at local y=0, exactly the flattened terrain's
   // height — without this clearance the two surfaces z-fight, showing as a fine
   // flickering/checkered moire pattern where the terrain and road interleave.
