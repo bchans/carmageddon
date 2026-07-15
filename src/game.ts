@@ -8,7 +8,7 @@ import { Economy, ROAD_COST, TOLL_REWARD } from "./economy";
 import { CameraController, MIN_ZOOM, MAX_ZOOM } from "./input";
 import { Autopilot } from "./autopilot";
 import { Hud } from "./hud";
-import { loadAssets } from "./assets";
+import { loadAssets, applyMaxAnisotropy } from "./assets";
 
 const FIXED_DT = 1 / 60;
 const TARGET_REACHED_RADIUS = TILE_SIZE * 1.1;
@@ -68,6 +68,9 @@ export class Game {
 
   async start(): Promise<void> {
     const [, assets] = await Promise.all([this.initPhysicsWorld(), loadAssets()]);
+    const maxAnisotropy = this.renderer.capabilities.getMaxAnisotropy();
+    applyMaxAnisotropy(assets.carScene, maxAnisotropy);
+    for (const template of Object.values(assets.road)) applyMaxAnisotropy(template, maxAnisotropy);
 
     this.setupLights();
     this.terrain = Terrain.generate(this.RAPIER, this.world, 1);

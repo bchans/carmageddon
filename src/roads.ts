@@ -15,6 +15,12 @@ const DECAL_HEIGHT = 0.08;
 // gentler than terrain's own natural slope cap so a fast-moving car reliably
 // keeps traction through a climb instead of catching air off a steep grade change.
 const MAX_GRADE_PITCH = 0.22;
+// Ramp launch surface: tilt angle (~28°, tuned steeper than the old 24° for a
+// more satisfying launch — see the ramp collider setup in place()), the total
+// span it covers from its entry edge, and its physical (invisible) thickness.
+const RAMP_LAUNCH_ANGLE = 0.49;
+const RAMP_LENGTH = TILE_SIZE * 1.5;
+const RAMP_THICKNESS = 0.5;
 
 /** Grading info for a straight tile climbing/descending a slope; junctions stay flat (null). */
 interface SlopeInfo {
@@ -139,12 +145,16 @@ class RoadTile {
    */
   applyGrade(centerHeight: number, slope: SlopeInfo | null): boolean {
     const changed = Math.abs(this.centerHeight - centerHeight) > 1e-4 || !slopesEqual(this.slope, slope);
+    const heightDelta = centerHeight - this.centerHeight;
     this.centerHeight = centerHeight;
     this.slope = slope;
     this.group.position.y = centerHeight;
     if (this.rampBody) {
+      // The tile is always flat under a ramp, so a height re-grade shifts the
+      // whole (already-pivoted-at-entry-edge) collider straight up/down by the
+      // same delta rather than needing to recompute the pivot.
       const t = this.rampBody.translation();
-      this.rampBody.setTranslation({ x: t.x, y: centerHeight + DECAL_HEIGHT / 2, z: t.z }, true);
+      this.rampBody.setTranslation({ x: t.x, y: t.y + heightDelta, z: t.z }, true);
     }
     return changed;
   }
@@ -340,8 +350,15 @@ function buildPlateMesh(kind: RoadKind, roadAssets: RoadAssets): THREE.Object3D 
   return buildKenneyMesh(roadAssets.crossroad, 0, kind, CITYBUILDER_SWATCH_LINEAR);
 }
 
+// The road-slant-high.glb template's own slope rises along its local +X axis at
+// rotationY=0 (verified empirically: sampling its vertices found a height
+// gradient across X, none across Z) — unlike the citybuilder pack's straight/curve
+// pieces, which run along local Z. So facing=E (which maps to local +X, i.e. no
+// rotation needed) is the rotational "zero", not facing=N; every other facing is
+// 90° steps from there.
 function buildRampMesh(facing: number, roadAssets: RoadAssets): THREE.Object3D {
-  return buildKenneyMesh(roadAssets.ramp, facing * (Math.PI / 2), RoadKind.Ramp, CITYKIT_SWATCH_LINEAR);
+  const rotationY = ((facing + 3) % 4) * (Math.PI / 2);
+  return buildKenneyMesh(roadAssets.ramp, rotationY, RoadKind.Ramp, CITYKIT_SWATCH_LINEAR);
 }
 
 // The corner template natively (rotationY = 0) connects dirs {3, 0} (W, N); the
@@ -567,22 +584,41 @@ export class RoadSystem {
     // other tile kind is visual + curbs only, relying on the (now-flattened)
     // terrain heightfield for support.
     if (kind === RoadKind.Ramp) {
-      const bodyDesc = this.RAPIER.RigidBodyDesc.fixed().setTranslation(center.x, center.y + DECAL_HEIGHT / 2, center.z);
-      const angle = -0.42; // radians, ramps upward towards the facing direction
-      const rotAxis = facing % 2 === 0 ? { x: 1, y: 0, z: 0 } : { x: 0, y: 0, z: 1 };
-      const sign = facing === 0 || facing === 3 ? 1 : -1;
-      const half = (angle * sign) / 2;
-      const s = Math.sin(half);
-      const c = Math.cos(half);
-      bodyDesc.setRotation({ x: rotAxis.x * s, y: rotAxis.y * s, z: rotAxis.z * s, w: c });
+      // Pivot the tilt at the ground-level entry edge (where this tile meets its
+      // incoming neighbor), not the tile center. Pivoting at the center buried the
+      // collider's entry half below the (flat) terrain and left its launch half
+      // floating unreachably high, so a car driving onto the tile just kept
+      // rolling across the terrain heightfield underneath — never actually
+      // touching the tilted ramp surface — instead of climbing and launching.
+      const travelDir = new THREE.Vector3(DIRS[facing].dc, 0, DIRS[facing].dr);
+      const entryEdge = center.clone().addScaledVector(travelDir, -TILE_SIZE / 2);
+      const bodyDesc = this.RAPIER.RigidBodyDesc.fixed().setTranslation(
+        entryEdge.x,
+        entryEdge.y + RAMP_THICKNESS / 2,
+        entryEdge.z,
+      );
+      // Rotating by +RAMP_LAUNCH_ANGLE around the horizontal axis perpendicular to
+      // travelDir always lifts a point offset along +travelDir upward, regardless
+      // of facing — verified for both axis-aligned cases (N/S rotates around X,
+      // E/W around Z) rather than needing per-facing sign flips.
+      const rotAxis = new THREE.Vector3(-travelDir.z, 0, travelDir.x);
+      const tilt = new THREE.Quaternion().setFromAxisAngle(rotAxis, RAMP_LAUNCH_ANGLE);
+      bodyDesc.setRotation({ x: tilt.x, y: tilt.y, z: tilt.z, w: tilt.w });
       const body = this.world.createRigidBody(bodyDesc);
-      // The collider's long half-extent (3, i.e. 6 units) always has to run along
-      // whichever local axis the tilt rotation above actually pitches — Z for a
-      // N/S ramp (rotated around X), X for an E/W ramp (rotated around Z). Using
-      // the same (2, 3) ordering for every facing left E/W ramps with a launch
-      // surface only 4 units long across the direction of travel instead of 6.
-      const [hx, hz] = facing % 2 === 0 ? [TILE_SIZE / 2, TILE_SIZE * 0.75] : [TILE_SIZE * 0.75, TILE_SIZE / 2];
-      const colliderDesc = this.RAPIER.ColliderDesc.cuboid(hx, DECAL_HEIGHT / 2, hz).setFriction(1.1);
+
+      // Ramp surface spans 1.5 tiles (RAMP_LENGTH) from the entry edge towards the
+      // launch end — matches the 2-tile jump distance used for its pathfinding
+      // shortcut edge in edgesFrom(). The long half-extent runs along Z for a N/S
+      // ramp (rotated around X) or X for an E/W ramp (rotated around Z).
+      const halfLen = RAMP_LENGTH / 2;
+      const halfWidth = TILE_SIZE / 2;
+      const [hx, hz] = facing % 2 === 0 ? [halfWidth, halfLen] : [halfLen, halfWidth];
+      const colliderDesc = this.RAPIER.ColliderDesc.cuboid(hx, RAMP_THICKNESS / 2, hz)
+        // Local offset (pre-rotation) so the box's near face sits at the pivot
+        // (entry edge) and it extends towards the launch end, rather than being
+        // centered on the pivot.
+        .setTranslation(travelDir.x * halfLen, 0, travelDir.z * halfLen)
+        .setFriction(1.1);
       this.world.createCollider(colliderDesc, body);
       tile.rampBody = body;
     }

@@ -47,3 +47,24 @@ export async function loadAssets(): Promise<AssetLibrary> {
   ]);
   return { carScene, road: { straight, straightLightposts, curve, tJunction, crossroad, ramp } };
 }
+
+/**
+ * Every loaded GLTF texture defaults to anisotropy=1 (no anisotropic filtering),
+ * which is fine head-on but aliases into a fine flickering checkerboard/moire
+ * pattern wherever a textured surface (road decals, car body) is viewed at a
+ * shallow angle — exactly the game's default top-down-ish camera. Call once
+ * per loaded object, after the renderer exists, so its actual hardware max is
+ * known instead of guessing a fixed value.
+ */
+export function applyMaxAnisotropy(root: THREE.Object3D, maxAnisotropy: number): void {
+  root.traverse((obj) => {
+    if (!(obj instanceof THREE.Mesh)) return;
+    const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
+    for (const mat of materials) {
+      for (const key of ["map", "normalMap", "roughnessMap", "metalnessMap", "aoMap", "emissiveMap"] as const) {
+        const tex = (mat as THREE.MeshStandardMaterial)[key];
+        if (tex) tex.anisotropy = maxAnisotropy;
+      }
+    }
+  });
+}
