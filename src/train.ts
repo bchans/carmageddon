@@ -1,86 +1,46 @@
 import * as THREE from "three";
+import type { TrainAssets } from "./assets";
 import { TILE_SIZE, type Waypoint } from "./network";
 import { PathFollower } from "./pathFollower";
 
-const FORWARD = new THREE.Vector3(0, 0, -1);
+// The Kenney train kit's own models face local +Z (verified by node name:
+// "wheels-front" sits at positive z on both the locomotive and carriage),
+// the opposite of the car's sedan.glb — so unlike Car (which flips an inner
+// visual group because its wheel rig is built assuming +Z front), it's
+// simplest here to just treat +Z as this vehicle's own forward and let
+// setFromUnitVectors orient it directly.
+const FORWARD = new THREE.Vector3(0, 0, 1);
 const ARRIVE_RADIUS = TILE_SIZE * 0.35;
 const FINAL_ARRIVE_RADIUS = TILE_SIZE * 0.45;
 export const TRAIN_SPEED = 9; // units/sec, kinematic — no physics/traction to simulate
 
-const bodyMat = new THREE.MeshStandardMaterial({ color: 0xb33a2e, roughness: 0.55, metalness: 0.2 });
-const cabMat = new THREE.MeshStandardMaterial({ color: 0x2b2b2e, roughness: 0.5 });
-const wagonMat = new THREE.MeshStandardMaterial({ color: 0x4a5a63, roughness: 0.6 });
-const wheelMat = new THREE.MeshStandardMaterial({ color: 0x1a1a1c, roughness: 0.7, metalness: 0.4 });
-const trimMat = new THREE.MeshStandardMaterial({ color: 0xe8c94a, roughness: 0.4, metalness: 0.3 });
-
-/** No Kenney train-kit reachable from this sandbox (kenney.nl is blocked by
- * the environment's network policy), so the locomotive + wagon are built
- * procedurally — low-poly boxes in the same faceted style as the terrain,
- * swappable later for a real GLB via this one function. */
-function buildWheelSet(length: number, halfTrack: number): THREE.Object3D {
+/** Clones the real Kenney locomotive + a trailing carriage, coupled with a small gap. */
+function buildTrainMesh(assets: TrainAssets): THREE.Object3D {
   const group = new THREE.Group();
-  const wheelGeo = new THREE.CylinderGeometry(0.22, 0.22, 0.12, 10);
-  for (const x of [-halfTrack, halfTrack]) {
-    for (const z of [-length / 2 + 0.3, length / 2 - 0.3]) {
-      const wheel = new THREE.Mesh(wheelGeo, wheelMat);
-      wheel.rotation.z = Math.PI / 2;
-      wheel.position.set(x, 0.22, z);
-      wheel.castShadow = true;
-      group.add(wheel);
-    }
-  }
-  return group;
-}
 
-function buildLocomotive(): THREE.Object3D {
-  const group = new THREE.Group();
-  const bodyLen = 2.6;
-
-  const boiler = new THREE.Mesh(new THREE.BoxGeometry(1.1, 0.9, bodyLen), bodyMat);
-  boiler.position.y = 0.75;
-  boiler.castShadow = true;
-  group.add(boiler);
-
-  const cab = new THREE.Mesh(new THREE.BoxGeometry(1.15, 0.75, 0.9), cabMat);
-  cab.position.set(0, 1.35, bodyLen / 2 - 0.55);
-  cab.castShadow = true;
-  group.add(cab);
-
-  const chimney = new THREE.Mesh(new THREE.CylinderGeometry(0.16, 0.2, 0.55, 10), cabMat);
-  chimney.position.set(0, 1.45, -bodyLen / 2 + 0.5);
-  chimney.castShadow = true;
-  group.add(chimney);
-
-  const stripe = new THREE.Mesh(new THREE.BoxGeometry(1.14, 0.1, bodyLen - 0.1), trimMat);
-  stripe.position.y = 1.05;
-  group.add(stripe);
-
-  group.add(buildWheelSet(bodyLen, 0.65));
-  return group;
-}
-
-function buildWagon(): THREE.Object3D {
-  const group = new THREE.Group();
-  const len = 2.1;
-  const box = new THREE.Mesh(new THREE.BoxGeometry(1.05, 0.85, len), wagonMat);
-  box.position.y = 0.65;
-  box.castShadow = true;
-  group.add(box);
-  group.add(buildWheelSet(len, 0.6));
-  return group;
-}
-
-function buildTrainMesh(): { group: THREE.Object3D; segments: THREE.Object3D[] } {
-  const group = new THREE.Group();
-  const loco = buildLocomotive();
+  const loco = assets.locomotive.clone(true);
   loco.position.z = 0;
+  loco.traverse((obj) => {
+    if (obj instanceof THREE.Mesh) {
+      obj.castShadow = true;
+      obj.receiveShadow = true;
+    }
+  });
   group.add(loco);
 
-  const wagon = buildWagon();
-  wagon.position.z = 2.85;
-  group.add(wagon);
+  const carriage = assets.carriage.clone(true);
+  // Locomotive half-length (1.3) + coupling gap + carriage half-length (1.35),
+  // trailing behind (i.e. towards -Z, opposite the +Z forward convention).
+  carriage.position.z = -(1.3 + 0.35 + 1.35);
+  carriage.traverse((obj) => {
+    if (obj instanceof THREE.Mesh) {
+      obj.castShadow = true;
+      obj.receiveShadow = true;
+    }
+  });
+  group.add(carriage);
 
-  return { group, segments: [loco, wagon] };
+  return group;
 }
 
 /**
@@ -95,9 +55,8 @@ export class Train {
   private readonly quaternion = new THREE.Quaternion();
   private readonly follower = new PathFollower();
 
-  constructor(spawn: THREE.Vector3) {
-    const built = buildTrainMesh();
-    this.mesh = built.group;
+  constructor(spawn: THREE.Vector3, assets: TrainAssets) {
+    this.mesh = buildTrainMesh(assets);
     this.position.copy(spawn);
     this.mesh.position.copy(spawn);
   }

@@ -1,58 +1,27 @@
 import * as THREE from "three";
+import type { ShipAssets } from "./assets";
 import { TILE_SIZE, type Waypoint } from "./network";
 import { PathFollower } from "./pathFollower";
 
-const FORWARD = new THREE.Vector3(0, 0, -1);
+// The Kenney watercraft kit's hull faces local +Z (verified by sampling hull
+// vertices: the +Z tip is much narrower than the -Z end, i.e. a pointed bow
+// vs. a flat stern) — the opposite of the car's sedan.glb — so it's simplest
+// to just treat +Z as this vehicle's own forward and let setFromUnitVectors
+// orient it directly, same as Train.
+const FORWARD = new THREE.Vector3(0, 0, 1);
 const ARRIVE_RADIUS = TILE_SIZE * 0.35;
 const FINAL_ARRIVE_RADIUS = TILE_SIZE * 0.45;
 export const SHIP_SPEED = 7; // units/sec, kinematic — no buoyancy/wake to simulate
 
-const hullMat = new THREE.MeshStandardMaterial({ color: 0xe8e4d8, roughness: 0.5 });
-const deckMat = new THREE.MeshStandardMaterial({ color: 0x8a6a4a, roughness: 0.7 });
-const cabinMat = new THREE.MeshStandardMaterial({ color: 0x3d5a6b, roughness: 0.45 });
-const trimMat = new THREE.MeshStandardMaterial({ color: 0xc23b3b, roughness: 0.5 });
-
-/** No Kenney watercraft-kit reachable from this sandbox (kenney.nl is blocked
- * by the environment's network policy), so the hull is a procedural low-poly
- * boat — swappable later for a real GLB via this one function. */
-function buildBoatMesh(): THREE.Object3D {
-  const group = new THREE.Group();
-
-  const hullShape = new THREE.Shape();
-  hullShape.moveTo(0, -1.3);
-  hullShape.quadraticCurveTo(0.7, -1.2, 0.62, -0.2);
-  hullShape.lineTo(0.55, 1.1);
-  hullShape.quadraticCurveTo(0.5, 1.35, 0, 1.35);
-  hullShape.quadraticCurveTo(-0.5, 1.35, -0.55, 1.1);
-  hullShape.lineTo(-0.62, -0.2);
-  hullShape.quadraticCurveTo(-0.7, -1.2, 0, -1.3);
-  const hullGeo = new THREE.ExtrudeGeometry(hullShape, { depth: 0.55, bevelEnabled: false });
-  hullGeo.rotateX(-Math.PI / 2);
-  hullGeo.translate(0, 0.3, 0);
-  const hull = new THREE.Mesh(hullGeo, hullMat);
-  hull.castShadow = true;
-  hull.receiveShadow = true;
-  group.add(hull);
-
-  const trim = new THREE.Mesh(new THREE.BoxGeometry(1.3, 0.12, 2.6), trimMat);
-  trim.position.y = 0.6;
-  group.add(trim);
-
-  const deck = new THREE.Mesh(new THREE.BoxGeometry(1.0, 0.08, 2.2), deckMat);
-  deck.position.y = 0.68;
-  group.add(deck);
-
-  const cabin = new THREE.Mesh(new THREE.BoxGeometry(0.85, 0.6, 0.9), cabinMat);
-  cabin.position.set(0, 1.02, 0.3);
-  cabin.castShadow = true;
-  group.add(cabin);
-
-  const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 1.4, 8), deckMat);
-  mast.position.set(0, 1.9, -0.6);
-  mast.castShadow = true;
-  group.add(mast);
-
-  return group;
+function buildBoatMesh(assets: ShipAssets): THREE.Object3D {
+  const boat = assets.boat.clone(true);
+  boat.traverse((obj) => {
+    if (obj instanceof THREE.Mesh) {
+      obj.castShadow = true;
+      obj.receiveShadow = true;
+    }
+  });
+  return boat;
 }
 
 /**
@@ -68,8 +37,8 @@ export class Ship {
   private readonly follower = new PathFollower();
   private bobPhase = Math.random() * Math.PI * 2;
 
-  constructor(spawn: THREE.Vector3) {
-    this.mesh = buildBoatMesh();
+  constructor(spawn: THREE.Vector3, assets: ShipAssets) {
+    this.mesh = buildBoatMesh(assets);
     this.position.copy(spawn);
     this.mesh.position.copy(spawn);
   }

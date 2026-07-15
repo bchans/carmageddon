@@ -2,7 +2,8 @@ import * as THREE from "three";
 import type RAPIER from "@dimforge/rapier3d-compat";
 import type { Rapier } from "./physics";
 import type { Terrain } from "./terrain";
-import { TileNetwork, TILE_SIZE, DIRS, type Cell } from "./network";
+import type { TrackAssets } from "./assets";
+import { TileNetwork, TILE_SIZE, DIRS, type Cell, buildKenneyMesh } from "./network";
 
 export const TrackKind = {
   Standard: "standard",
@@ -13,11 +14,42 @@ export const TRACK_SPEED_MULTIPLIER: Record<TrackKind, number> = {
   [TrackKind.Standard]: 1,
 };
 
-// Procedural rail geometry — no Kenney kit reachable from this sandbox
-// (kenney.nl is blocked by the environment's network policy), so tracks are
-// built directly from primitives instead of a loaded GLB, at the same
-// unit-tile scale the road pieces use (the group gets scaled by TILE_SIZE
-// like everything else placed on the grid).
+// Kenney's train kit (real assets — kenney.nl itself is blocked from this
+// sandbox, but the user supplied the kit directly) is already authored at
+// tile scale (railroad-straight.glb spans exactly 4 units, matching
+// TILE_SIZE) and with its origin at one corner rather than centered, unlike
+// the city-builder road kit — assets.ts recenters the straight/curve
+// templates once at load time so they drop into the same buildKenneyMesh
+// pipeline roads use. No color retint is wanted (the kit's own silver
+// rail / brown tie colors are already right), so straight/curve pass an
+// identity tint.
+const IDENTITY_TINT_TARGET = 0xffffff;
+const IDENTITY_SWATCH: number[] = [1, 1, 1];
+
+// The corner-large template natively (rotationY = 0) connects dirs {1, 2}
+// (E, S) — verified empirically by rendering it at rotationY=0 with tile-edge
+// markers and reading off which two edges its rails actually touched (see
+// the "Wire real Kenney track assets" work — different pivot than the road
+// kit's corner piece, which natively connects {3, 0}).
+const TRACK_CORNER_NATIVE_DIRS: [number, number] = [1, 2];
+
+function buildStraightTrack(axisIsZ: boolean, pitch: number, trackAssets: TrackAssets): THREE.Object3D {
+  return buildKenneyMesh(trackAssets.straight, axisIsZ ? 0 : Math.PI / 2, IDENTITY_TINT_TARGET, IDENTITY_SWATCH, pitch, 1);
+}
+
+function buildCurveTrack(dirs: [number, number], trackAssets: TrackAssets): THREE.Object3D {
+  const [a, b] = dirs;
+  const nativeStart = a === 0 && b === 3 ? 3 : a;
+  const steps = (((nativeStart - TRACK_CORNER_NATIVE_DIRS[0]) % 4) + 4) % 4;
+  return buildKenneyMesh(trackAssets.curve, steps * (Math.PI / 2), IDENTITY_TINT_TARGET, IDENTITY_SWATCH, 0, 1);
+}
+
+// --- Procedural fallback for 3-/4-way junctions --------------------------
+//
+// The train kit has no T-junction/crossing piece (real rail networks rarely
+// have a literal 4-way rail crossing either), so a junction tile — otherwise
+// rare — falls back to simple procedural rail arms instead of a missing
+// asset.
 const RAIL_GAUGE = 0.16;
 const RAIL_WIDTH = 0.035;
 const RAIL_HEIGHT = 0.05;
@@ -31,7 +63,6 @@ const railMaterial = new THREE.MeshStandardMaterial({ color: 0x8b909b, roughness
 const tieMaterial = new THREE.MeshStandardMaterial({ color: 0x4a3524, roughness: 0.95 });
 const bedMaterial = new THREE.MeshStandardMaterial({ color: 0x6b6459, roughness: 1 });
 
-/** One rail arm (two rails + ties) running from the tile center to the edge in the given direction. */
 function buildRailArm(dir: number): THREE.Group {
   const { dc, dr } = DIRS[dir];
   const isNS = dc === 0;
@@ -63,39 +94,30 @@ function buildRailArm(dir: number): THREE.Group {
   return arm;
 }
 
-function buildTrackTile(mask: boolean[], pitch: number): THREE.Object3D {
+function buildJunctionTile(dirs: number[]): THREE.Object3D {
   const group = new THREE.Group();
   const bed = new THREE.Mesh(new THREE.BoxGeometry(0.92, BED_HEIGHT, 0.92), bedMaterial);
   bed.position.y = BED_HEIGHT / 2;
   bed.receiveShadow = true;
   group.add(bed);
-
-  let dirs = [0, 1, 2, 3].filter((d) => mask[d]);
-  if (dirs.length === 0) dirs = [0, 2]; // isolated tile: default N/S stub so it isn't blank
   for (const d of dirs) group.add(buildRailArm(d));
-
-  // Only a straight run (1 or 2-opposite connections) ever carries a nonzero
-  // pitch — junction shapes always grade flat — so deriving the travel axis
-  // from the first connected direction is safe here the same way
-  // RoadSystem's straight-mesh builder does.
-  if (pitch !== 0) {
-    const axisIsZ = dirs[0] % 2 === 0;
-    group.rotation.x = axisIsZ ? pitch : 0;
-    group.rotation.z = axisIsZ ? 0 : -pitch;
-  }
   group.scale.setScalar(TILE_SIZE);
   return group;
 }
 
 export class TrackSystem extends TileNetwork<TrackKind> {
+  private readonly trackAssets: TrackAssets;
+
   constructor(
     RAPIER: Rapier,
     world: RAPIER.World,
     terrain: Terrain,
+    trackAssets: TrackAssets,
     isCellFree: (cell: Cell) => boolean,
     claimCell: (cell: Cell) => void,
   ) {
     super(RAPIER, world, terrain, isCellFree, claimCell);
+    this.trackAssets = trackAssets;
   }
 
   protected speedMultiplier(kind: TrackKind): number {
@@ -103,7 +125,16 @@ export class TrackSystem extends TileNetwork<TrackKind> {
   }
 
   protected buildMesh(_kind: TrackKind, _facing: number, mask: boolean[], _cell: Cell, pitch: number): THREE.Object3D {
-    return buildTrackTile(mask, pitch);
+    const dirs = [0, 1, 2, 3].filter((d) => mask[d]);
+    if (dirs.length >= 3) return buildJunctionTile(dirs);
+    if (dirs.length === 2) {
+      const [a, b] = dirs;
+      const opposite = (a + 2) % 4 === b;
+      if (opposite) return buildStraightTrack(a % 2 === 0, pitch, this.trackAssets);
+      return buildCurveTrack([a, b] as [number, number], this.trackAssets);
+    }
+    if (dirs.length === 1) return buildStraightTrack(dirs[0] % 2 === 0, pitch, this.trackAssets);
+    return buildStraightTrack(true, pitch, this.trackAssets); // isolated tile: default N/S stub
   }
 
   protected curbColor(): number {

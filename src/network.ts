@@ -101,16 +101,30 @@ export function srgbToLinear(c: number): number {
   return c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
 }
 
-/** Clones a Kenney template, scales it to tile size, tilts/rotates it, and recolors it via a gamma-correct tint multiplier. */
+/**
+ * Recenters a template's own geometry (not its .position, which a caller like
+ * buildKenneyMesh may later overwrite outright rather than add to) so its
+ * bounding-box center sits at the local origin. Needed for kits — like
+ * Kenney's train track pieces — authored with the origin at one corner/edge
+ * instead of centered the way the city-builder road kit is.
+ */
+export function recenterTemplateGeometry(root: THREE.Object3D, center: THREE.Vector3): void {
+  root.traverse((obj) => {
+    if (obj instanceof THREE.Mesh) obj.geometry.translate(-center.x, -center.y, -center.z);
+  });
+}
+
+/** Clones a Kenney template, scales it, tilts/rotates it, and recolors it via a gamma-correct tint multiplier. `scale` defaults to TILE_SIZE for kits authored at unit-tile size; pass 1 for a kit already authored at tile scale. */
 export function buildKenneyMesh(
   template: THREE.Object3D,
   rotationY: number,
   targetColorHex: number,
   swatchLinear: number[],
   pitch = 0,
+  scale = TILE_SIZE,
 ): THREE.Object3D {
   const mesh = template.clone(true);
-  mesh.scale.setScalar(TILE_SIZE);
+  mesh.scale.setScalar(scale);
   // THREE's default 'XYZ' Euler order composes as Rx * Ry * Rz, which — read as a
   // transform applied to a vector — rotates around Y (yaw) *first* and X (pitch)
   // *last*, using the fixed world X axis. For an E/W run that pitches the

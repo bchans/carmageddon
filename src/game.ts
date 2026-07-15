@@ -109,6 +109,9 @@ export class Game {
     const maxAnisotropy = this.renderer.capabilities.getMaxAnisotropy();
     applyMaxAnisotropy(assets.carScene, maxAnisotropy);
     for (const template of Object.values(assets.road)) applyMaxAnisotropy(template, maxAnisotropy);
+    for (const template of Object.values(assets.track)) applyMaxAnisotropy(template, maxAnisotropy);
+    for (const template of Object.values(assets.train)) applyMaxAnisotropy(template, maxAnisotropy);
+    for (const template of Object.values(assets.ship)) applyMaxAnisotropy(template, maxAnisotropy);
 
     this.setupLights();
     this.terrain = Terrain.generate(this.RAPIER, this.world, 1);
@@ -121,7 +124,7 @@ export class Game {
     const claimCell = (kind: TransportKind) => (cell: Cell) => this.occupancy.set(cellKey(cell), kind);
 
     this.roads = new RoadSystem(this.RAPIER, this.world, this.terrain, assets.road, isCellFree("car"), claimCell("car"));
-    this.tracks = new TrackSystem(this.RAPIER, this.world, this.terrain, isCellFree("train"), claimCell("train"));
+    this.tracks = new TrackSystem(this.RAPIER, this.world, this.terrain, assets.track, isCellFree("train"), claimCell("train"));
     this.canals = new CanalSystem(this.RAPIER, this.world, this.terrain, isCellFree("ship"), claimCell("ship"));
     this.scene.add(this.roads.root, this.tracks.root, this.canals.root);
 
@@ -138,11 +141,11 @@ export class Game {
     this.car.mesh.visible = false;
     this.scene.add(this.car.mesh);
 
-    this.train = new Train(this.trainSpawn);
+    this.train = new Train(this.trainSpawn, assets.train);
     this.train.mesh.visible = false;
     this.scene.add(this.train.mesh);
 
-    this.ship = new Ship(this.shipSpawn);
+    this.ship = new Ship(this.shipSpawn, assets.ship);
     this.ship.mesh.visible = false;
     this.scene.add(this.ship.mesh);
 
