@@ -3,17 +3,22 @@ import type RAPIER from "@dimforge/rapier3d-compat";
 import { initPhysics, type Rapier } from "./physics";
 import { Terrain } from "./terrain";
 import { Car } from "./car";
-import { RoadSystem, RoadKind, TILE_SIZE, SPEED_MULTIPLIER } from "./roads";
-import { Economy, ROAD_COST, TOLL_REWARD } from "./economy";
+import { RoadSystem, RoadKind, SPEED_MULTIPLIER } from "./roads";
+import { TrackSystem, TrackKind } from "./tracks";
+import { CanalSystem, CanalKind } from "./canals";
+import { TILE_SIZE, cellKey, worldToCell, type Cell, type Waypoint } from "./network";
+import { Train } from "./train";
+import { Ship } from "./ship";
+import { Economy, ROAD_COST, TRACK_COST, CANAL_COST, TOLL_REWARD, SPACE_COST_SCALE } from "./economy";
 import { CameraController, MIN_ZOOM, MAX_ZOOM } from "./input";
 import { Autopilot } from "./autopilot";
-import { Hud } from "./hud";
+import { Hud, type BuildOption } from "./hud";
 import { loadAssets, applyMaxAnisotropy } from "./assets";
 
 const FIXED_DT = 1 / 60;
 const TARGET_REACHED_RADIUS = TILE_SIZE * 1.1;
 const SPAWN_MARGIN = 5;
-const BUILD_TIME = 24; // seconds of build time before the car departs each round
+const BUILD_TIME = 24; // seconds of build time before the vehicle departs each round
 
 // The very first target sits close to spawn (cheap, quick win); each round
 // after that pushes the next target progressively farther out, so difficulty
@@ -23,6 +28,20 @@ const RAMP_ROUNDS = 6;
 
 const CAMERA_BASE_HEIGHT = 70;
 const CAMERA_BASE_BACK = 45;
+
+type TransportKind = "car" | "train" | "ship";
+const TRANSPORT_KINDS: TransportKind[] = ["car", "train", "ship"];
+const TRANSPORT_LABEL: Record<TransportKind, string> = { car: "🚗 Car", train: "🚂 Train", ship: "⛴ Ship" };
+
+const ROAD_LABELS: Record<RoadKind, string> = {
+  [RoadKind.Standard]: "Road",
+  [RoadKind.Mud]: "Mud (cheap, slow)",
+  [RoadKind.Boost]: "Boost strip",
+  [RoadKind.Crossroad]: "Crossroad",
+  [RoadKind.Ramp]: "Ramp",
+};
+const TRACK_LABELS: Record<TrackKind, string> = { [TrackKind.Standard]: "Track" };
+const CANAL_LABELS: Record<CanalKind, string> = { [CanalKind.Standard]: "Canal" };
 
 export class Game {
   private scene = new THREE.Scene();
@@ -35,22 +54,41 @@ export class Game {
   private world!: RAPIER.World;
   private terrain!: Terrain;
   private car!: Car;
+  private train!: Train;
+  private ship!: Ship;
   private roads!: RoadSystem;
+  private tracks!: TrackSystem;
+  private canals!: CanalSystem;
   private economy = new Economy();
   private cameraController!: CameraController;
   private autopilot = new Autopilot();
   private hud!: Hud;
 
-  private selectedRoadKind: RoadKind = RoadKind.Standard;
-  private spawnWorld = new THREE.Vector3();
-  private targetWorld = new THREE.Vector3();
+  // Shared cross-transport grid occupancy — a cell claimed by one network
+  // blocks every other network's canPlace(), which is what makes the three
+  // transports actually start competing for space as the map fills up.
+  private occupancy = new Map<string, TransportKind>();
+
+  private selectedBuildKind = "";
+  private activeTransport: TransportKind = "car";
+
+  private carSpawn = new THREE.Vector3();
+  private carSpawnEdge = 0;
+  private carTarget = new THREE.Vector3();
+  private trainSpawn = new THREE.Vector3();
+  private trainSpawnEdge = 0;
+  private trainTarget = new THREE.Vector3();
+  private shipSpawn = new THREE.Vector3();
+  private shipSpawnEdge = 0;
+  private shipTarget = new THREE.Vector3();
+
   private spawnMarker!: THREE.Object3D;
   private targetMarker!: THREE.Object3D;
   private hoverMarker!: THREE.Mesh;
   private rng: () => number;
   private container: HTMLElement;
 
-  private carActive = false;
+  private vehicleActive = false;
   private buildTimer = BUILD_TIME;
   private lastCountdownSecond = -1;
   private roundNumber = 0;
@@ -76,29 +114,44 @@ export class Game {
     this.terrain = Terrain.generate(this.RAPIER, this.world, 1);
     this.scene.add(this.terrain.mesh, this.terrain.waterMesh);
 
-    this.roads = new RoadSystem(this.RAPIER, this.world, this.terrain, assets.road);
-    this.scene.add(this.roads.root);
+    const isCellFree = (kind: TransportKind) => (cell: Cell) => {
+      const owner = this.occupancy.get(cellKey(cell));
+      return owner === undefined || owner === kind;
+    };
+    const claimCell = (kind: TransportKind) => (cell: Cell) => this.occupancy.set(cellKey(cell), kind);
 
-    this.spawnWorld = this.pickEdgePoint(-1);
-    this.targetWorld = this.pickTargetPoint();
-    this.roads.setEndpoints(this.spawnWorld, this.targetWorld);
+    this.roads = new RoadSystem(this.RAPIER, this.world, this.terrain, assets.road, isCellFree("car"), claimCell("car"));
+    this.tracks = new TrackSystem(this.RAPIER, this.world, this.terrain, isCellFree("train"), claimCell("train"));
+    this.canals = new CanalSystem(this.RAPIER, this.world, this.terrain, isCellFree("ship"), claimCell("ship"));
+    this.scene.add(this.roads.root, this.tracks.root, this.canals.root);
 
-    const initialSpawn = this.spawnWorld.clone();
-    initialSpawn.y += 1;
-    this.car = new Car(this.RAPIER, this.world, initialSpawn, assets.carScene, this.economy.computeCarStats());
-    this.car.mesh.visible = false; // hidden until the build countdown elapses
+    this.carSpawnEdge = Math.floor(this.rng() * 4);
+    this.carSpawn = this.pickEdgePoint(this.carSpawnEdge);
+    this.trainSpawnEdge = Math.floor(this.rng() * 4);
+    this.trainSpawn = this.pickEdgePoint(this.trainSpawnEdge);
+    this.shipSpawnEdge = Math.floor(this.rng() * 4);
+    this.shipSpawn = this.pickEdgePoint(this.shipSpawnEdge);
+
+    const carSpawnLift = this.carSpawn.clone();
+    carSpawnLift.y += 1;
+    this.car = new Car(this.RAPIER, this.world, carSpawnLift, assets.carScene, this.economy.computeCarStats());
+    this.car.mesh.visible = false;
     this.scene.add(this.car.mesh);
+
+    this.train = new Train(this.trainSpawn);
+    this.train.mesh.visible = false;
+    this.scene.add(this.train.mesh);
+
+    this.ship = new Ship(this.shipSpawn);
+    this.ship.mesh.visible = false;
+    this.scene.add(this.ship.mesh);
 
     this.spawnMarker = buildMarker(0x4ade80, true);
     this.scene.add(this.spawnMarker);
-    this.spawnMarker.position.copy(this.spawnWorld);
-    this.spawnMarker.position.y += 2.2;
-
     this.targetMarker = buildMarker(0xffd23f, false);
     this.scene.add(this.targetMarker);
     this.hoverMarker = buildHoverMarker();
     this.scene.add(this.hoverMarker);
-    this.updateTargetMarker();
 
     this.cameraController = new CameraController(this.renderer.domElement, {
       onTap: (x, y) => this.onTap(x, y),
@@ -106,14 +159,14 @@ export class Game {
     });
 
     this.hud = new Hud(this.container, {
-      onSelectRoad: (kind) => {
-        this.selectedRoadKind = kind;
-        this.hud.setSelectedRoad(kind);
+      onSelectBuild: (id) => {
+        this.selectedBuildKind = id;
+        this.hud.setSelectedBuild(id);
       },
       onBuyUpgrade: (key) => {
         if (this.economy.buyUpgrade(key)) {
           this.car.applyUpgrades(this.economy.computeCarStats());
-          this.hud.update(this.economy);
+          this.hud.update(this.economy, this.costMultiplier());
         }
       },
       onZoomIn: () => {
@@ -122,12 +175,12 @@ export class Game {
       onZoomOut: () => {
         this.cameraController.zoom = Math.max(MIN_ZOOM, this.cameraController.zoom / 1.3);
       },
-      onLocateSpawn: () => this.cameraController.panOffset.set(this.spawnWorld.x, this.spawnWorld.z),
-      onLocateTarget: () => this.cameraController.panOffset.set(this.targetWorld.x, this.targetWorld.z),
+      onLocateSpawn: () => this.cameraController.panOffset.set(this.activeSpawn().x, this.activeSpawn().z),
+      onLocateTarget: () => this.cameraController.panOffset.set(this.activeTarget().x, this.activeTarget().z),
     });
-    this.hud.setSelectedRoad(this.selectedRoadKind);
-    this.hud.update(this.economy);
-    this.updateCountdownStatus();
+
+    this.activeTransport = TRANSPORT_KINDS[Math.floor(this.rng() * TRANSPORT_KINDS.length)];
+    this.beginRound();
 
     this.onResize();
     this.renderer.setAnimationLoop(this.loop);
@@ -157,38 +210,43 @@ export class Game {
   }
 
   /**
-   * Snaps a coordinate to the road grid (multiples of TILE_SIZE) so a picked
-   * point always lands exactly on a tile center — matching where the road
-   * network's cellWorldCenter() will place things, so the car doesn't spawn
-   * straddling a tile edge/curb where it can catch and get stuck.
+   * Snaps a coordinate to the shared grid (multiples of TILE_SIZE) so a picked
+   * point always lands exactly on a tile center — matching where a network's
+   * cellWorldCenter() will place things, so a vehicle doesn't spawn straddling
+   * a tile edge/curb where it can catch and get stuck.
    */
   private snapToGrid(v: number): number {
     return Math.round(v / TILE_SIZE) * TILE_SIZE;
   }
 
-  /** Picks a valid (dry, not-too-steep) point along the -X or +X edge of the map. */
-  private pickEdgePoint(side: -1 | 1): THREE.Vector3 {
+  /** Picks a valid (dry, not-too-steep) point along one of the map's 4 edges (0=N, 1=E, 2=S, 3=W). */
+  private pickEdgePoint(edge: number): THREE.Vector3 {
     const half = this.terrain.worldSize / 2 - SPAWN_MARGIN;
-    const x = this.snapToGrid(side * half);
+    const isNS = edge === 0 || edge === 2; // fixed on Z, roams X
+    const fixed = this.snapToGrid((edge === 0 || edge === 1 ? 1 : -1) * half);
     for (let attempt = 0; attempt < 60; attempt++) {
-      const z = this.snapToGrid((this.rng() * 2 - 1) * half);
+      const roam = this.snapToGrid((this.rng() * 2 - 1) * half);
+      const x = isNS ? roam : fixed;
+      const z = isNS ? fixed : roam;
       if (this.terrain.isUnderwaterAt(x, z)) continue;
       if (this.terrain.getSlopeAt(x, z) > 0.9) continue;
       const p = new THREE.Vector3(x, 0, z);
       p.y = this.terrain.getHeightAt(x, z);
       return p;
     }
-    const p = new THREE.Vector3(x, 0, 0);
-    p.y = this.terrain.getHeightAt(x, 0);
+    const x = isNS ? 0 : fixed;
+    const z = isNS ? fixed : 0;
+    const p = new THREE.Vector3(x, 0, z);
+    p.y = this.terrain.getHeightAt(x, z);
     return p;
   }
 
   /**
-   * Picks a valid target at a distance from spawn that grows with the round
-   * number — round 0 is a short, cheap first connection; later rounds push
-   * further out towards the map edge.
+   * Picks a valid target on a different edge than `spawn` sits on, at a
+   * distance that grows with the round number — round 0 is a short, cheap
+   * first connection; later rounds push further out towards the map edge.
    */
-  private pickTargetPoint(): THREE.Vector3 {
+  private pickTargetPoint(spawn: THREE.Vector3, spawnEdge: number): THREE.Vector3 {
     const half = this.terrain.worldSize / 2 - SPAWN_MARGIN;
     const maxDist = this.terrain.worldSize * 0.8;
     const targetDist = THREE.MathUtils.lerp(MIN_TARGET_DIST, maxDist, Math.min(1, this.roundNumber / RAMP_ROUNDS));
@@ -196,50 +254,129 @@ export class Game {
     for (let attempt = 0; attempt < 80; attempt++) {
       const angle = this.rng() * Math.PI * 2;
       const dist = targetDist * (0.75 + this.rng() * 0.25);
-      const x = this.snapToGrid(THREE.MathUtils.clamp(this.spawnWorld.x + Math.cos(angle) * dist, -half, half));
-      const z = this.snapToGrid(THREE.MathUtils.clamp(this.spawnWorld.z + Math.sin(angle) * dist, -half, half));
-      if (Math.hypot(x - this.spawnWorld.x, z - this.spawnWorld.z) < MIN_TARGET_DIST * 0.6) continue;
+      const x = this.snapToGrid(THREE.MathUtils.clamp(spawn.x + Math.cos(angle) * dist, -half, half));
+      const z = this.snapToGrid(THREE.MathUtils.clamp(spawn.z + Math.sin(angle) * dist, -half, half));
+      if (Math.hypot(x - spawn.x, z - spawn.z) < MIN_TARGET_DIST * 0.6) continue;
       if (this.terrain.isUnderwaterAt(x, z)) continue;
       if (this.terrain.getSlopeAt(x, z) > 0.9) continue;
       const p = new THREE.Vector3(x, 0, z);
       p.y = this.terrain.getHeightAt(x, z);
       return p;
     }
-    return this.pickEdgePoint(1);
+    // Fall back to a point on a genuinely different edge so it's never
+    // degenerately close to spawn.
+    let edge = Math.floor(this.rng() * 4);
+    if (edge === spawnEdge) edge = (edge + 1) % 4;
+    return this.pickEdgePoint(edge);
   }
 
-  private updateTargetMarker(): void {
-    this.targetMarker.position.copy(this.targetWorld);
+  private activeSpawn(): THREE.Vector3 {
+    if (this.activeTransport === "car") return this.carSpawn;
+    if (this.activeTransport === "train") return this.trainSpawn;
+    return this.shipSpawn;
+  }
+
+  private activeTarget(): THREE.Vector3 {
+    if (this.activeTransport === "car") return this.carTarget;
+    if (this.activeTransport === "train") return this.trainTarget;
+    return this.shipTarget;
+  }
+
+  private updateMarkers(): void {
+    this.spawnMarker.position.copy(this.activeSpawn());
+    this.spawnMarker.position.y += 2.2;
+    this.targetMarker.position.copy(this.activeTarget());
     this.targetMarker.position.y += 2.2;
   }
 
-  /** Recomputes the road network path and hands it to the autopilot. */
+  /** Fraction of the buildable grid already claimed by any transport — the "harder because space is taken up" difficulty knob. */
+  private occupiedFraction(): number {
+    const totalCells = Math.pow(this.terrain.worldSize / TILE_SIZE - 2, 2);
+    const used = this.roads.tileCount + this.tracks.tileCount + this.canals.tileCount;
+    return Math.min(1, used / totalCells);
+  }
+
+  private costMultiplier(): number {
+    return 1 + this.occupiedFraction() * SPACE_COST_SCALE;
+  }
+
+  private buildOptionsFor(kind: TransportKind): BuildOption[] {
+    if (kind === "car") {
+      return Object.values(RoadKind).map((k) => ({ id: k, label: ROAD_LABELS[k], baseCost: ROAD_COST[k] }));
+    }
+    if (kind === "train") {
+      return Object.values(TrackKind).map((k) => ({ id: k, label: TRACK_LABELS[k], baseCost: TRACK_COST[k] }));
+    }
+    return Object.values(CanalKind).map((k) => ({ id: k, label: CANAL_LABELS[k], baseCost: CANAL_COST[k] }));
+  }
+
+  /** Recomputes the active network's route and hands it to whichever vehicle is running this round. */
   private refreshPath(): void {
-    const path = this.roads.findPath();
+    if (this.activeTransport === "car") {
+      const path = this.roads.findPath();
+      if (path) {
+        this.autopilot.setPath(this.roads.buildWaypoints(path, this.carSpawn, this.carTarget));
+        this.hud.setStatus("Driving to the toll marker");
+      } else {
+        this.autopilot.clearPath();
+        this.hud.setStatus("No route yet — build a road to continue");
+      }
+      return;
+    }
+    if (this.activeTransport === "train") {
+      const path = this.tracks.findPath();
+      if (path) {
+        this.train.setPath(this.tracks.buildWaypoints(path, this.trainSpawn, this.trainTarget));
+        this.hud.setStatus("Train en route to the toll marker");
+      } else {
+        this.train.clearPath();
+        this.hud.setStatus("No route yet — lay track to continue");
+      }
+      return;
+    }
+    const path = this.canals.findPath();
     if (path) {
-      this.autopilot.setPath(this.roads.buildWaypoints(path, this.spawnWorld, this.targetWorld));
-      this.hud.setStatus("Driving to the toll marker");
+      const waypoints = this.canals.buildWaypoints(path, this.shipSpawn, this.shipTarget).map((w): Waypoint => {
+        // A canal's own graded height is its carved bed, not the water
+        // surface it floats on — the ship rides at a fixed water-level
+        // height along its route instead of sinking to the bed.
+        const p = w.position.clone();
+        p.y = this.terrain.waterMesh.position.y;
+        return { position: p, slow: w.slow };
+      });
+      this.ship.setPath(waypoints);
+      this.hud.setStatus("Ship en route to the toll marker");
     } else {
-      this.autopilot.clearPath();
-      this.hud.setStatus("No route yet — build a road to continue");
+      this.ship.clearPath();
+      this.hud.setStatus("No route yet — dig a canal to continue");
     }
   }
 
   private onTap(clientX: number, clientY: number): void {
     const cell = this.raycastCell(clientX, clientY);
     if (!cell) return;
-    if (!this.roads.canPlace(cell)) {
-      this.hud.showMessage("Can't place there — must connect to your road network.");
+
+    const network = this.activeTransport === "car" ? this.roads : this.activeTransport === "train" ? this.tracks : this.canals;
+    if (!network.canPlace(cell)) {
+      this.hud.showMessage("Can't place there — must connect to your network, and stay off other transports' tiles.");
       return;
     }
-    const cost = ROAD_COST[this.selectedRoadKind];
+    const baseCost =
+      this.activeTransport === "car"
+        ? ROAD_COST[this.selectedBuildKind as RoadKind]
+        : this.activeTransport === "train"
+          ? TRACK_COST[this.selectedBuildKind as TrackKind]
+          : CANAL_COST[this.selectedBuildKind as CanalKind];
+    const cost = Math.round(baseCost * this.costMultiplier());
     if (!this.economy.canAfford(cost)) {
       this.hud.showMessage("Not enough toll money for that.");
       return;
     }
     this.economy.spend(cost);
-    this.roads.place(cell, this.selectedRoadKind);
-    this.hud.update(this.economy);
+    if (this.activeTransport === "car") this.roads.place(cell, this.selectedBuildKind as RoadKind);
+    else if (this.activeTransport === "train") this.tracks.place(cell, this.selectedBuildKind as TrackKind);
+    else this.canals.place(cell, this.selectedBuildKind as CanalKind);
+    this.hud.update(this.economy, this.costMultiplier());
     this.refreshPath();
   }
 
@@ -249,15 +386,16 @@ export class Game {
       this.hoverMarker.visible = false;
       return;
     }
-    const center = this.roads.cellWorldCenter(cell);
+    const network = this.activeTransport === "car" ? this.roads : this.activeTransport === "train" ? this.tracks : this.canals;
+    const center = network.cellWorldCenter(cell);
     this.hoverMarker.position.set(center.x, center.y + 0.1, center.z);
     this.hoverMarker.visible = true;
-    const ok = this.roads.canPlace(cell);
+    const ok = network.canPlace(cell);
     (this.hoverMarker.material as THREE.MeshBasicMaterial).color.set(ok ? 0x4ade80 : 0xef4444);
   }
 
   private raycaster = new THREE.Raycaster();
-  private raycastCell(clientX: number, clientY: number): { col: number; row: number } | null {
+  private raycastCell(clientX: number, clientY: number): Cell | null {
     const rect = this.renderer.domElement.getBoundingClientRect();
     const ndc = new THREE.Vector2(
       ((clientX - rect.left) / rect.width) * 2 - 1,
@@ -266,7 +404,7 @@ export class Game {
     this.raycaster.setFromCamera(ndc, this.camera);
     const hit = this.raycaster.intersectObject(this.terrain.mesh, false)[0];
     if (!hit) return null;
-    return this.roads.worldToCell(hit.point.x, hit.point.z);
+    return worldToCell(hit.point.x, hit.point.z);
   }
 
   private onResize = (): void => {
@@ -288,41 +426,60 @@ export class Game {
   };
 
   private stepPhysics(dt: number): void {
-    if (!this.carActive) {
+    if (!this.vehicleActive) {
       this.buildTimer -= dt;
       this.updateCountdownStatus();
       this.car.speedZoneMultiplier = 1;
       this.car.update(dt, { throttle: 0, steer: 0, brake: true, boost: false });
       this.world.step();
-      if (this.buildTimer <= 0) this.activateCar();
+      if (this.buildTimer <= 0) this.activateVehicle();
       return;
     }
 
-    const p = this.car.position;
-    const onRoad = this.roads.getKindAt(p.x, p.z);
-    if (onRoad) {
-      this.car.speedZoneMultiplier = SPEED_MULTIPLIER[onRoad];
-    } else if (this.terrain.isUnderwaterAt(p.x, p.z)) {
-      this.car.speedZoneMultiplier = 0.12;
-    } else {
-      this.car.speedZoneMultiplier = 1;
-    }
-    const input = this.autopilot.computeInput(p, this.car.mesh.quaternion);
-    this.car.update(dt, input);
-    this.world.step();
+    if (this.activeTransport === "car") {
+      const p = this.car.position;
+      const onRoad = this.roads.getKindAt(p.x, p.z);
+      if (onRoad) {
+        this.car.speedZoneMultiplier = SPEED_MULTIPLIER[onRoad];
+      } else if (this.terrain.isUnderwaterAt(p.x, p.z)) {
+        this.car.speedZoneMultiplier = 0.12;
+      } else {
+        this.car.speedZoneMultiplier = 1;
+      }
+      const input = this.autopilot.computeInput(p, this.car.mesh.quaternion);
+      this.car.update(dt, input);
+      this.world.step();
 
-    if (this.car.position.distanceTo(this.targetWorld) < TARGET_REACHED_RADIUS) {
-      this.onTollReached();
+      if (this.car.position.distanceTo(this.carTarget) < TARGET_REACHED_RADIUS) this.onTollReached();
+      if (this.car.position.y < -20) this.car.respawn(this.carSpawn.clone().setY(this.carSpawn.y + 1));
+      return;
     }
-    if (this.car.position.y < -20) {
-      this.car.respawn(this.spawnWorld.clone().setY(this.spawnWorld.y + 1));
+
+    // Train/ship are kinematic (no Rapier body), so the world still needs a
+    // step for the car's own always-present physics body/curbs, even on a
+    // train/ship round.
+    this.world.step();
+    if (this.activeTransport === "train") {
+      this.train.update(dt);
+      if (this.train.position3.distanceTo(this.trainTarget) < TARGET_REACHED_RADIUS) this.onTollReached();
+    } else {
+      this.ship.update(dt);
+      if (this.ship.position3.distanceTo(this.shipTarget) < TARGET_REACHED_RADIUS) this.onTollReached();
     }
   }
 
-  private activateCar(): void {
-    this.carActive = true;
-    this.car.respawn(this.spawnWorld.clone().setY(this.spawnWorld.y + 1));
-    this.car.mesh.visible = true;
+  private activateVehicle(): void {
+    this.vehicleActive = true;
+    if (this.activeTransport === "car") {
+      this.car.respawn(this.carSpawn.clone().setY(this.carSpawn.y + 1));
+      this.car.mesh.visible = true;
+    } else if (this.activeTransport === "train") {
+      this.train.respawn(this.trainSpawn);
+      this.train.mesh.visible = true;
+    } else {
+      this.ship.respawn(this.shipSpawn.clone().setY(this.terrain.waterMesh.position.y));
+      this.ship.mesh.visible = true;
+    }
     this.refreshPath();
   }
 
@@ -330,23 +487,49 @@ export class Game {
     const seconds = Math.max(0, Math.ceil(this.buildTimer));
     if (seconds === this.lastCountdownSecond) return;
     this.lastCountdownSecond = seconds;
-    this.hud.setStatus(`Build phase — car departs in ${seconds}s`);
+    this.hud.setStatus(`Build phase — ${TRANSPORT_LABEL[this.activeTransport]} departs in ${seconds}s`);
   }
 
   private onTollReached(): void {
     this.economy.addToll();
-    this.hud.showMessage(`Toll paid! +${TOLL_REWARD} — build the next road.`);
     this.roundNumber += 1;
-    this.targetWorld = this.pickTargetPoint();
-    this.roads.setEndpoints(this.spawnWorld, this.targetWorld);
-    this.updateTargetMarker();
-    this.hud.update(this.economy);
+    this.activeTransport = TRANSPORT_KINDS[Math.floor(this.rng() * TRANSPORT_KINDS.length)];
+    this.hud.showMessage(`Toll paid! +${TOLL_REWARD} — next round is ${TRANSPORT_LABEL[this.activeTransport]}.`);
+    this.beginRound();
+  }
 
-    this.carActive = false;
+  /** Shared setup for both the very first round and every subsequent round transition. */
+  private beginRound(): void {
     this.car.mesh.visible = false;
+    this.train.mesh.visible = false;
+    this.ship.mesh.visible = false;
+
+    if (this.activeTransport === "car") {
+      this.carTarget = this.pickTargetPoint(this.carSpawn, this.carSpawnEdge);
+      this.roads.setEndpoints(this.carSpawn, this.carTarget);
+    } else if (this.activeTransport === "train") {
+      this.trainTarget = this.pickTargetPoint(this.trainSpawn, this.trainSpawnEdge);
+      this.tracks.setEndpoints(this.trainSpawn, this.trainTarget);
+    } else {
+      this.shipTarget = this.pickTargetPoint(this.shipSpawn, this.shipSpawnEdge);
+      this.canals.setEndpoints(this.shipSpawn, this.shipTarget);
+    }
+
+    this.updateMarkers();
+    this.hud.setRoundBanner(`Round ${this.roundNumber + 1} — ${TRANSPORT_LABEL[this.activeTransport]}`);
+    this.hud.setBuildOptions(this.buildOptionsFor(this.activeTransport));
+    const firstOption = this.buildOptionsFor(this.activeTransport)[0];
+    this.selectedBuildKind = firstOption.id;
+    this.hud.setSelectedBuild(this.selectedBuildKind);
+    this.hud.update(this.economy, this.costMultiplier());
+
+    this.vehicleActive = false;
     this.buildTimer = BUILD_TIME;
     this.lastCountdownSecond = -1;
     this.autopilot.clearPath();
+    this.train.clearPath();
+    this.ship.clearPath();
+    this.updateCountdownStatus();
   }
 
   private updateCamera(): void {

@@ -1,5 +1,7 @@
 import { BASE_CAR_STATS, type CarStats } from "./car";
 import { RoadKind } from "./roads";
+import { TrackKind } from "./tracks";
+import { CanalKind } from "./canals";
 
 export const STARTING_CURRENCY = 40;
 export const TOLL_REWARD = 28;
@@ -11,6 +13,20 @@ export const ROAD_COST: Record<RoadKind, number> = {
   [RoadKind.Crossroad]: 18,
   [RoadKind.Ramp]: 12,
 };
+
+export const TRACK_COST: Record<TrackKind, number> = {
+  [TrackKind.Standard]: 7,
+};
+
+// Digging a canal bed is pricier than laying pavement/rail on ground that's
+// already there.
+export const CANAL_COST: Record<CanalKind, number> = {
+  [CanalKind.Standard]: 10,
+};
+
+// How much every build cost scales up as the map fills up (see Game's
+// occupiedFraction) — the core "harder because space is taken up" knob.
+export const SPACE_COST_SCALE = 1.6;
 
 export type UpgradeKey = "engine" | "suspension" | "grip" | "boost";
 

@@ -1,13 +1,4 @@
-import { RoadKind } from "./roads";
-import { ROAD_COST, type Economy, type UpgradeKey } from "./economy";
-
-const ROAD_LABELS: Record<RoadKind, string> = {
-  [RoadKind.Standard]: "Road",
-  [RoadKind.Mud]: "Mud (cheap, slow)",
-  [RoadKind.Boost]: "Boost strip",
-  [RoadKind.Crossroad]: "Crossroad",
-  [RoadKind.Ramp]: "Ramp",
-};
+import { type Economy, type UpgradeKey } from "./economy";
 
 const UPGRADE_LABELS: Record<UpgradeKey, string> = {
   engine: "Engine",
@@ -16,8 +7,14 @@ const UPGRADE_LABELS: Record<UpgradeKey, string> = {
   boost: "Boost tank",
 };
 
+export interface BuildOption {
+  id: string;
+  label: string;
+  baseCost: number;
+}
+
 export interface HudCallbacks {
-  onSelectRoad: (kind: RoadKind) => void;
+  onSelectBuild: (id: string) => void;
   onBuyUpgrade: (key: UpgradeKey) => void;
   onZoomIn: () => void;
   onZoomOut: () => void;
@@ -29,12 +26,16 @@ export class Hud {
   private root: HTMLDivElement;
   private currencyEl: HTMLDivElement;
   private statusEl: HTMLDivElement;
+  private roundEl: HTMLDivElement;
   private messageEl: HTMLDivElement;
-  private roadButtons = new Map<RoadKind, HTMLButtonElement>();
+  private buildRow: HTMLDivElement;
+  private buildButtons = new Map<string, { btn: HTMLButtonElement; option: BuildOption }>();
   private upgradeButtons = new Map<UpgradeKey, HTMLButtonElement>();
   private messageTimer: number | undefined;
+  private callbacks: HudCallbacks;
 
   constructor(mount: HTMLElement, callbacks: HudCallbacks) {
+    this.callbacks = callbacks;
     this.root = document.createElement("div");
     this.root.className = "hud";
 
@@ -42,9 +43,12 @@ export class Hud {
     topBar.className = "hud-topbar";
     this.currencyEl = document.createElement("div");
     this.currencyEl.className = "hud-currency";
+    this.roundEl = document.createElement("div");
+    this.roundEl.className = "hud-round";
     this.statusEl = document.createElement("div");
     this.statusEl.className = "hud-phase";
     topBar.appendChild(this.currencyEl);
+    topBar.appendChild(this.roundEl);
     topBar.appendChild(this.statusEl);
     this.root.appendChild(topBar);
 
@@ -55,16 +59,9 @@ export class Hud {
     const buildPanel = document.createElement("div");
     buildPanel.className = "hud-build-panel";
 
-    const roadRow = document.createElement("div");
-    roadRow.className = "hud-row";
-    for (const kind of Object.values(RoadKind)) {
-      const btn = document.createElement("button");
-      btn.className = "hud-btn";
-      btn.addEventListener("click", () => callbacks.onSelectRoad(kind));
-      roadRow.appendChild(btn);
-      this.roadButtons.set(kind, btn);
-    }
-    buildPanel.appendChild(roadRow);
+    this.buildRow = document.createElement("div");
+    this.buildRow.className = "hud-row";
+    buildPanel.appendChild(this.buildRow);
 
     const upgradeRow = document.createElement("div");
     upgradeRow.className = "hud-row";
@@ -102,18 +99,36 @@ export class Hud {
     this.statusEl.textContent = text;
   }
 
-  setSelectedRoad(kind: RoadKind | null): void {
-    for (const [k, btn] of this.roadButtons) {
-      btn.classList.toggle("selected", k === kind);
+  setRoundBanner(text: string): void {
+    this.roundEl.textContent = text;
+  }
+
+  /** Rebuilds the build-palette row for whichever transport is active this round. */
+  setBuildOptions(options: BuildOption[]): void {
+    this.buildRow.replaceChildren();
+    this.buildButtons.clear();
+    for (const option of options) {
+      const btn = document.createElement("button");
+      btn.className = "hud-btn";
+      btn.addEventListener("click", () => this.callbacks.onSelectBuild(option.id));
+      this.buildRow.appendChild(btn);
+      this.buildButtons.set(option.id, { btn, option });
     }
   }
 
-  update(economy: Economy): void {
+  setSelectedBuild(id: string | null): void {
+    for (const [optId, { btn }] of this.buildButtons) {
+      btn.classList.toggle("selected", optId === id);
+    }
+  }
+
+  /** `costMultiplier` scales every build option's price (see Game.occupiedFraction — building gets pricier as the map fills up). */
+  update(economy: Economy, costMultiplier = 1): void {
     this.currencyEl.textContent = `\u{1F4B0} ${Math.floor(economy.currency)}`;
 
-    for (const [kind, btn] of this.roadButtons) {
-      const cost = ROAD_COST[kind];
-      btn.textContent = `${ROAD_LABELS[kind]} (${cost})`;
+    for (const { btn, option } of this.buildButtons.values()) {
+      const cost = Math.round(option.baseCost * costMultiplier);
+      btn.textContent = `${option.label} (${cost})`;
       btn.disabled = economy.currency < cost;
     }
 

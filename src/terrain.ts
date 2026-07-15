@@ -9,7 +9,7 @@ export const TERRAIN_SEGMENTS = 30; // vertices per side = SEGMENTS + 1; keeps t
 const GRID = TERRAIN_SEGMENTS + 1;
 const SPACING = TERRAIN_SIZE / TERRAIN_SEGMENTS;
 
-const WATER_LEVEL = 0.4;
+export const WATER_LEVEL = 0.4;
 
 function mulberry32(seed: number): () => number {
   let a = seed;

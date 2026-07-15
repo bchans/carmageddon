@@ -59,6 +59,15 @@ canvas {
   backdrop-filter: blur(4px);
 }
 
+.hud-round {
+  background: rgba(10, 14, 22, 0.7);
+  padding: 8px 14px;
+  border-radius: 10px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  backdrop-filter: blur(4px);
+}
+
 .hud-message {
   align-self: center;
   margin-top: 10vh;
