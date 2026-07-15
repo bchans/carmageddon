@@ -73,6 +73,17 @@ function directionBetween(from: Cell, to: Cell): number | null {
   return null;
 }
 
+function slopesEqual(a: SlopeInfo | null, b: SlopeInfo | null): boolean {
+  if (a === null || b === null) return a === b;
+  const eps = 1e-4;
+  return (
+    a.axisIsZ === b.axisIsZ &&
+    Math.abs(a.pitch - b.pitch) < eps &&
+    Math.abs(a.loHeight - b.loHeight) < eps &&
+    Math.abs(a.hiHeight - b.hiHeight) < eps
+  );
+}
+
 class RoadTile {
   readonly cell: Cell;
   readonly kind: RoadKind;
@@ -87,6 +98,10 @@ class RoadTile {
   private slope: SlopeInfo | null;
   /** For ramps: the direction (index into DIRS) the ramp launches towards. */
   readonly facing: number;
+  /** For ramps: the fixed launch-surface collider body, kept flush with the tile's
+   * pad height across later re-grades (see applyGrade) instead of only ever being
+   * positioned once at initial placement. */
+  rampBody: RAPIER.RigidBody | null = null;
 
   constructor(
     RAPIER: Rapier,
@@ -116,11 +131,22 @@ class RoadTile {
    * new neighbor connects on a third or fourth side — and the terrain under
    * it has to be re-flattened to match, not left however it was graded for
    * the tile's shape at the time it was first placed.
+   *
+   * Returns whether the height/slope actually changed, so callers can decide
+   * whether this tile's own neighbors need re-grading in turn — a tile's edge
+   * height is sampled from the live terrain, which a neighbor's own re-grade
+   * can just have overwritten at their shared boundary.
    */
-  applyGrade(centerHeight: number, slope: SlopeInfo | null): void {
+  applyGrade(centerHeight: number, slope: SlopeInfo | null): boolean {
+    const changed = Math.abs(this.centerHeight - centerHeight) > 1e-4 || !slopesEqual(this.slope, slope);
     this.centerHeight = centerHeight;
     this.slope = slope;
     this.group.position.y = centerHeight;
+    if (this.rampBody) {
+      const t = this.rampBody.translation();
+      this.rampBody.setTranslation({ x: t.x, y: centerHeight + DECAL_HEIGHT / 2, z: t.z }, true);
+    }
+    return changed;
   }
 
   /**
@@ -558,32 +584,69 @@ export class RoadSystem {
       const [hx, hz] = facing % 2 === 0 ? [TILE_SIZE / 2, TILE_SIZE * 0.75] : [TILE_SIZE * 0.75, TILE_SIZE / 2];
       const colliderDesc = this.RAPIER.ColliderDesc.cuboid(hx, DECAL_HEIGHT / 2, hz).setFriction(1.1);
       this.world.createCollider(colliderDesc, body);
+      tile.rampBody = body;
     }
     this.tiles.set(cellKey(cell), tile);
 
-    // Recompute shape/curbs for this tile and every orthogonal neighbor tile
-    // (a neighbor's own shape may need to upgrade, e.g. straight -> curve).
-    this.refreshCurbs(cell);
-    for (const { dc, dr } of DIRS) {
-      this.refreshCurbs({ col: cell.col + dc, row: cell.row + dr });
-    }
+    // Recompute shape/curbs for this tile and every orthogonal neighbor tile,
+    // cascading further outward wherever a tile's grade actually changes (a
+    // neighbor's own shape may need to upgrade, e.g. straight -> curve, and
+    // that can in turn change the terrain height at a shared edge that one of
+    // *its* other neighbors sampled its own slope from).
+    this.propagateRegrade([cell, ...DIRS.map(({ dc, dr }) => ({ col: cell.col + dc, row: cell.row + dr }))]);
     return true;
   }
 
-  private refreshCurbs(cell: Cell): void {
+  /**
+   * Re-grades each seed cell, and whenever a tile's height/slope actually
+   * changes, enqueues its own placed neighbors too — re-grading isn't
+   * confined to direct neighbors of the newly placed tile because a tile
+   * samples its own edge height from the live (possibly just-flattened)
+   * terrain, so a change can ripple past the immediate neighbor and leave a
+   * more distant tile's pavement stale relative to the ground under it
+   * (visible as the pavement clipping into or floating above the terrain).
+   */
+  private propagateRegrade(seed: Cell[]): void {
+    const queue: Cell[] = [...seed];
+    const queued = new Set(queue.map(cellKey));
+    // Defensive cap: this converges in practice (each re-grade averages
+    // toward its neighbors' current heights), but bound the loop so a
+    // pathological chain of edits can't hang the tab instead of settling.
+    const maxIterations = Math.max(64, this.tiles.size * 8);
+    let iterations = 0;
+    while (queue.length > 0 && iterations < maxIterations) {
+      iterations++;
+      const cell = queue.shift()!;
+      queued.delete(cellKey(cell));
+      if (!this.refreshCurbs(cell)) continue;
+      for (const { dc, dr } of DIRS) {
+        const neighbor = { col: cell.col + dc, row: cell.row + dr };
+        const key = cellKey(neighbor);
+        if (this.tiles.has(key) && !queued.has(key)) {
+          queue.push(neighbor);
+          queued.add(key);
+        }
+      }
+    }
+  }
+
+  /** Re-grades and rebuilds a single tile's mesh/curbs; returns whether its height/slope changed. */
+  private refreshCurbs(cell: Cell): boolean {
     const tile = this.tiles.get(cellKey(cell));
-    if (!tile) return;
+    if (!tile) return false;
     // A newly-placed neighbor can change this tile's own rendered shape (e.g.
     // straight -> curve/T/crossroad plate as a third or fourth side connects),
     // which changes whether it should be flat or sloped — re-grade the ground
     // under it to match before rebuilding the mesh/curbs, not just once at the
-    // tile's original placement. Ramp/Crossroad kind pieces always render as
-    // their own fixed asset regardless of shape, so their pad is left as-is.
-    if (tile.kind !== RoadKind.Ramp && tile.kind !== RoadKind.Crossroad) {
-      const { flatHeight, slope } = this.gradeCell(cell, tile.kind);
-      tile.applyGrade(flatHeight, slope);
-    }
+    // tile's original placement. This applies to every kind, including
+    // Ramp/Crossroad: their own asset is always flat/fixed regardless of
+    // shape, but their *pad height* still needs to track their connected
+    // edges, same as any junction tile (applyGrade keeps a ramp's launch
+    // collider glued to its pad if that height moves).
+    const { flatHeight, slope } = this.gradeCell(cell, tile.kind);
+    const changed = tile.applyGrade(flatHeight, slope);
     tile.updateConnections(this.connectionMask(cell), this.tileConnectionMask(cell));
+    return changed;
   }
 
   /**
