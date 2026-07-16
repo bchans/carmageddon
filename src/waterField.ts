@@ -50,6 +50,11 @@ const SHALLOW_COLOR = new THREE.Color(0x6fb2c9);
 const DEEP_COLOR = new THREE.Color(0x1f5a86);
 const MIN_ALPHA = 0.12;
 const MAX_ALPHA = 0.82;
+// How fast the smoothed per-vertex flow display decays back towards zero
+// once the underlying diffusion stops moving water through a vertex — a
+// short tail rather than an instant cut so a just-stopped trickle doesn't
+// visually snap to glassy-still.
+const FLOW_VIS_DECAY = 4.0;
 
 function createWaterMaterial(): THREE.MeshStandardMaterial {
   const material = new THREE.MeshStandardMaterial({
@@ -63,15 +68,28 @@ function createWaterMaterial(): THREE.MeshStandardMaterial {
     shader.uniforms.shallowRefDepth = { value: SHALLOW_REF_DEPTH };
     shader.uniforms.minAlpha = { value: MIN_ALPHA };
     shader.uniforms.maxAlpha = { value: MAX_ALPHA };
+    shader.uniforms.uTime = { value: 0 };
 
     shader.vertexShader = shader.vertexShader
       .replace(
         "#include <common>",
-        "#include <common>\nattribute float waterDepth;\nvarying float vWaterDepth;",
+        [
+          "#include <common>",
+          "attribute float waterDepth;",
+          "attribute vec2 waterFlow;",
+          "varying float vWaterDepth;",
+          "varying vec2 vWaterFlow;",
+          "varying vec2 vWaterWorldXZ;",
+        ].join("\n"),
       )
       .replace(
         "#include <begin_vertex>",
-        "#include <begin_vertex>\nvWaterDepth = waterDepth;",
+        [
+          "#include <begin_vertex>",
+          "vWaterDepth = waterDepth;",
+          "vWaterFlow = waterFlow;",
+          "vWaterWorldXZ = position.xz;",
+        ].join("\n"),
       );
 
     shader.fragmentShader = shader.fragmentShader
@@ -80,11 +98,14 @@ function createWaterMaterial(): THREE.MeshStandardMaterial {
         [
           "#include <common>",
           "varying float vWaterDepth;",
+          "varying vec2 vWaterFlow;",
+          "varying vec2 vWaterWorldXZ;",
           "uniform vec3 shallowColor;",
           "uniform vec3 deepColor;",
           "uniform float shallowRefDepth;",
           "uniform float minAlpha;",
           "uniform float maxAlpha;",
+          "uniform float uTime;",
         ].join("\n"),
       )
       .replace(
@@ -97,9 +118,22 @@ function createWaterMaterial(): THREE.MeshStandardMaterial {
           "  float grazing = 1.0 - clamp(dot(normalize(vNormal), normalize(vViewPosition)), 0.0, 1.0);",
           "  float fresnel = pow(grazing, 3.0);",
           "  diffuseColor.a = clamp(mix(minAlpha, maxAlpha, depthT) + fresnel * 0.25, 0.0, 1.0);",
+          // Streaks stretched along the local flow direction and scrolled
+          // over time at a speed tied to flow strength, so moving water
+          // visibly streams while still water stays glassy (flowMag ~ 0
+          // gates the whole term out).
+          "  float flowMag = length(vWaterFlow);",
+          "  vec2 flowDir = flowMag > 0.0001 ? vWaterFlow / flowMag : vec2(0.0, 1.0);",
+          "  float scroll = uTime * (0.8 + flowMag * 3.0);",
+          "  vec2 rippleCoord = vWaterWorldXZ * 0.6 + flowDir * scroll;",
+          "  float streak = sin(dot(rippleCoord, vec2(1.0, 0.3)) * 3.0) * 0.5",
+          "               + sin(dot(rippleCoord, vec2(0.3, -1.0)) * 5.0 + uTime) * 0.5;",
+          "  float ripple = smoothstep(0.4, 1.0, streak) * clamp(flowMag * 6.0, 0.0, 1.0);",
+          "  diffuseColor.rgb += ripple * 0.18;",
           "}",
         ].join("\n"),
       );
+    material.userData.shader = shader;
   };
   return material;
 }
@@ -150,9 +184,21 @@ export class WaterField {
   private readonly originalHeights: Float32Array;
   private depth: Float32Array;
   private scratch: Float32Array;
+  /** Smoothed per-vertex flow display (world-space x/z), decayed and refed
+   * each step from the instant diffusion amounts below — purely cosmetic,
+   * drives the flow-direction ripple in the shader. */
+  private readonly flowX: Float32Array;
+  private readonly flowZ: Float32Array;
+  /** Scratch accumulators for this step's raw diffusion flow, reset and
+   * refilled every step() before being folded into flowX/flowZ. */
+  private readonly instantFlowX: Float32Array;
+  private readonly instantFlowZ: Float32Array;
+  private time = 0;
+  private readonly material: THREE.MeshStandardMaterial;
   private readonly positions: Float32Array;
   private readonly normals: Float32Array;
   private readonly vertexDepths: Float32Array;
+  private readonly vertexFlow: Float32Array;
   /** Active pumps as resolved grid-vertex index pairs (resolved once at
    * registration, since a pump's cell never moves) — see registerPump(). */
   private readonly pumps: Array<{ fromIdx: number; toIdx: number }> = [];
@@ -163,6 +209,10 @@ export class WaterField {
     this.originalHeights = terrain.heights.slice();
     this.depth = new Float32Array(GRID * GRID);
     this.scratch = new Float32Array(GRID * GRID);
+    this.flowX = new Float32Array(GRID * GRID);
+    this.flowZ = new Float32Array(GRID * GRID);
+    this.instantFlowX = new Float32Array(GRID * GRID);
+    this.instantFlowZ = new Float32Array(GRID * GRID);
 
     // Seed every naturally-submerged cell full at generation, so lakes,
     // rivers, and the ocean edge look right from the very first frame
@@ -178,14 +228,18 @@ export class WaterField {
     this.normals = new Float32Array(maxQuads * 18);
     // 2 triangles * 3 vertices * 1 float per quad.
     this.vertexDepths = new Float32Array(maxQuads * 6);
+    // 2 triangles * 3 vertices * 2 floats (x, z) per quad.
+    this.vertexFlow = new Float32Array(maxQuads * 12);
 
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute("position", new THREE.BufferAttribute(this.positions, 3));
     geometry.setAttribute("normal", new THREE.BufferAttribute(this.normals, 3));
     geometry.setAttribute("waterDepth", new THREE.BufferAttribute(this.vertexDepths, 1));
+    geometry.setAttribute("waterFlow", new THREE.BufferAttribute(this.vertexFlow, 2));
     geometry.setDrawRange(0, 0);
 
-    this.mesh = new THREE.Mesh(geometry, createWaterMaterial());
+    this.material = createWaterMaterial();
+    this.mesh = new THREE.Mesh(geometry, this.material);
     this.mesh.receiveShadow = true;
     this.rebuildMesh();
   }
@@ -222,6 +276,11 @@ export class WaterField {
     // bare terrain slope), and without this cap that alone would compute a
     // nonzero "flow" and slowly leak phantom water across dry ground with
     // no real source anywhere nearby.
+    const instantFlowX = this.instantFlowX;
+    const instantFlowZ = this.instantFlowZ;
+    instantFlowX.fill(0);
+    instantFlowZ.fill(0);
+
     for (let iy = 0; iy < GRID; iy++) {
       for (let ix = 0; ix < GRID; ix++) {
         const i = idx(iy, ix);
@@ -232,6 +291,10 @@ export class WaterField {
           flow = flow > 0 ? Math.min(flow, next[i]) : Math.max(flow, -next[j]);
           next[i] -= flow;
           next[j] += flow;
+          // Positive flow moves from i to j, i.e. in the +x direction — record
+          // that at both endpoints as a (purely cosmetic) local flow vector.
+          instantFlowX[i] += flow;
+          instantFlowX[j] += flow;
         }
         if (iy + 1 < GRID) {
           const j = idx(iy + 1, ix);
@@ -240,11 +303,26 @@ export class WaterField {
           flow = flow > 0 ? Math.min(flow, next[i]) : Math.max(flow, -next[j]);
           next[i] -= flow;
           next[j] += flow;
+          instantFlowZ[i] += flow;
+          instantFlowZ[j] += flow;
         }
       }
     }
 
     for (let i = 0; i < next.length; i++) depth[i] = Math.max(0, next[i]);
+
+    // Fold this step's raw flow into the smoothed display vectors — decay
+    // the old value towards zero, then add the fresh amount, so a vertex
+    // that's stopped moving fades out over ~1/FLOW_VIS_DECAY seconds rather
+    // than snapping instantly to "still".
+    const flowDecay = Math.exp(-FLOW_VIS_DECAY * dt);
+    for (let i = 0; i < this.flowX.length; i++) {
+      this.flowX[i] = this.flowX[i] * flowDecay + instantFlowX[i];
+      this.flowZ[i] = this.flowZ[i] * flowDecay + instantFlowZ[i];
+    }
+    this.time += dt;
+    const shader = this.material.userData.shader;
+    if (shader) shader.uniforms.uTime.value = this.time;
 
     // Pass 3: pumps. A direction-agnostic, explicit exception to "water
     // only flows downhill" — each registered pump pulls depth straight
@@ -384,10 +462,14 @@ export class WaterField {
   private rebuildMesh(): void {
     const heights = this.terrain.heights;
     const depth = this.depth;
+    const flowX = this.flowX;
+    const flowZ = this.flowZ;
     const pos = this.positions;
     const vdepth = this.vertexDepths;
+    const vflow = this.vertexFlow;
     let offset = 0;
     let depthOffset = 0;
+    let flowOffset = 0;
 
     for (let iy = 0; iy < GRID - 1; iy++) {
       for (let ix = 0; ix < GRID - 1; ix++) {
@@ -415,6 +497,14 @@ export class WaterField {
         offset = writeTri(pos, offset, x0, y00, z0, x0, y01, z1, x1, y11, z1);
         depthOffset = writeTriScalar(vdepth, depthOffset, d00, d11, d10);
         depthOffset = writeTriScalar(vdepth, depthOffset, d00, d01, d11);
+        flowOffset = writeTriVec2(
+          vflow, flowOffset,
+          flowX[i00], flowZ[i00], flowX[i11], flowZ[i11], flowX[i10], flowZ[i10],
+        );
+        flowOffset = writeTriVec2(
+          vflow, flowOffset,
+          flowX[i00], flowZ[i00], flowX[i01], flowZ[i01], flowX[i11], flowZ[i11],
+        );
       }
     }
 
@@ -425,6 +515,7 @@ export class WaterField {
     geometry.computeVertexNormals();
     (geometry.attributes.normal as THREE.BufferAttribute).needsUpdate = true;
     (geometry.attributes.waterDepth as THREE.BufferAttribute).needsUpdate = true;
+    (geometry.attributes.waterFlow as THREE.BufferAttribute).needsUpdate = true;
     geometry.computeBoundingSphere();
   }
 }
@@ -447,4 +538,17 @@ function writeTriScalar(arr: Float32Array, offset: number, a: number, b: number,
   arr[offset + 1] = b;
   arr[offset + 2] = c;
   return offset + 3;
+}
+
+function writeTriVec2(
+  arr: Float32Array,
+  offset: number,
+  ax: number, az: number,
+  bx: number, bz: number,
+  cx: number, cz: number,
+): number {
+  arr[offset] = ax; arr[offset + 1] = az;
+  arr[offset + 2] = bx; arr[offset + 3] = bz;
+  arr[offset + 4] = cx; arr[offset + 5] = cz;
+  return offset + 6;
 }
