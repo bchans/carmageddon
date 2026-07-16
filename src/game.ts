@@ -6,7 +6,7 @@ import { Car } from "./car";
 import { RoadSystem, RoadKind, SPEED_MULTIPLIER } from "./roads";
 import { TrackSystem, TrackKind } from "./tracks";
 import { CanalSystem, CanalKind } from "./canals";
-import { TILE_SIZE, cellKey, worldToCell, type Cell, type Waypoint } from "./network";
+import { TILE_SIZE, DIRS, cellKey, worldToCell, type Cell, type Waypoint } from "./network";
 import { Train } from "./train";
 import { Ship } from "./ship";
 import { Economy, ROAD_COST, TRACK_COST, CANAL_COST, TOLL_REWARD, SPACE_COST_SCALE } from "./economy";
@@ -19,12 +19,6 @@ const FIXED_DT = 1 / 60;
 const TARGET_REACHED_RADIUS = TILE_SIZE * 1.1;
 const SPAWN_MARGIN = 5;
 const BUILD_TIME = 24; // seconds of build time before the vehicle departs each round
-
-// The very first target sits close to spawn (cheap, quick win); each round
-// after that pushes the next target progressively farther out, so difficulty
-// ramps instead of demanding a full map-width connection from round one.
-const MIN_TARGET_DIST = 8;
-const RAMP_ROUNDS = 6;
 
 const CAMERA_BASE_HEIGHT = 70;
 const CAMERA_BASE_BACK = 45;
@@ -112,6 +106,7 @@ export class Game {
     for (const template of Object.values(assets.track)) applyMaxAnisotropy(template, maxAnisotropy);
     for (const template of Object.values(assets.train)) applyMaxAnisotropy(template, maxAnisotropy);
     for (const template of Object.values(assets.ship)) applyMaxAnisotropy(template, maxAnisotropy);
+    for (const template of Object.values(assets.canal)) applyMaxAnisotropy(template, maxAnisotropy);
 
     this.setupLights();
     this.terrain = Terrain.generate(this.RAPIER, this.world, 1);
@@ -125,7 +120,7 @@ export class Game {
 
     this.roads = new RoadSystem(this.RAPIER, this.world, this.terrain, assets.road, isCellFree("car"), claimCell("car"));
     this.tracks = new TrackSystem(this.RAPIER, this.world, this.terrain, assets.track, isCellFree("train"), claimCell("train"));
-    this.canals = new CanalSystem(this.RAPIER, this.world, this.terrain, isCellFree("ship"), claimCell("ship"));
+    this.canals = new CanalSystem(this.RAPIER, this.world, this.terrain, assets.canal, isCellFree("ship"), claimCell("ship"));
     this.scene.add(this.roads.root, this.tracks.root, this.canals.root);
 
     this.carSpawnEdge = Math.floor(this.rng() * 4);
@@ -245,32 +240,22 @@ export class Game {
   }
 
   /**
-   * Picks a valid target on a different edge than `spawn` sits on, at a
-   * distance that grows with the round number — round 0 is a short, cheap
-   * first connection; later rounds push further out towards the map edge.
+   * Picks a target on a random edge that isn't the spawn edge — every round
+   * connects two genuinely different edges of the map, not just some far-off
+   * interior point.
    */
-  private pickTargetPoint(spawn: THREE.Vector3, spawnEdge: number): THREE.Vector3 {
-    const half = this.terrain.worldSize / 2 - SPAWN_MARGIN;
-    const maxDist = this.terrain.worldSize * 0.8;
-    const targetDist = THREE.MathUtils.lerp(MIN_TARGET_DIST, maxDist, Math.min(1, this.roundNumber / RAMP_ROUNDS));
-
-    for (let attempt = 0; attempt < 80; attempt++) {
-      const angle = this.rng() * Math.PI * 2;
-      const dist = targetDist * (0.75 + this.rng() * 0.25);
-      const x = this.snapToGrid(THREE.MathUtils.clamp(spawn.x + Math.cos(angle) * dist, -half, half));
-      const z = this.snapToGrid(THREE.MathUtils.clamp(spawn.z + Math.sin(angle) * dist, -half, half));
-      if (Math.hypot(x - spawn.x, z - spawn.z) < MIN_TARGET_DIST * 0.6) continue;
-      if (this.terrain.isUnderwaterAt(x, z)) continue;
-      if (this.terrain.getSlopeAt(x, z) > 0.9) continue;
-      const p = new THREE.Vector3(x, 0, z);
-      p.y = this.terrain.getHeightAt(x, z);
-      return p;
-    }
-    // Fall back to a point on a genuinely different edge so it's never
-    // degenerately close to spawn.
-    let edge = Math.floor(this.rng() * 4);
-    if (edge === spawnEdge) edge = (edge + 1) % 4;
+  private pickTargetPoint(spawnEdge: number): THREE.Vector3 {
+    const otherEdges = [0, 1, 2, 3].filter((e) => e !== spawnEdge);
+    const edge = otherEdges[Math.floor(this.rng() * otherEdges.length)];
     return this.pickEdgePoint(edge);
+  }
+
+  /** The horizontal direction a vehicle should face when it spawns on `edge`, so it starts out driving into the map instead of towards the boundary/off the map. */
+  private edgeInwardDir(edge: number): THREE.Vector3 {
+    // Edge 0=N (+Z side) faces -Z inward, 1=E (+X side) faces -X, 2=S (-Z side)
+    // faces +Z, 3=W (-X side) faces +X — i.e. the opposite of DIRS[edge].
+    const outward = DIRS[edge];
+    return new THREE.Vector3(-outward.dc, 0, -outward.dr);
   }
 
   private activeSpawn(): THREE.Vector3 {
@@ -454,7 +439,9 @@ export class Game {
       this.world.step();
 
       if (this.car.position.distanceTo(this.carTarget) < TARGET_REACHED_RADIUS) this.onTollReached();
-      if (this.car.position.y < -20) this.car.respawn(this.carSpawn.clone().setY(this.carSpawn.y + 1));
+      if (this.car.position.y < -20) {
+        this.car.respawn(this.carSpawn.clone().setY(this.carSpawn.y + 1), this.edgeInwardDir(this.carSpawnEdge));
+      }
       return;
     }
 
@@ -474,13 +461,13 @@ export class Game {
   private activateVehicle(): void {
     this.vehicleActive = true;
     if (this.activeTransport === "car") {
-      this.car.respawn(this.carSpawn.clone().setY(this.carSpawn.y + 1));
+      this.car.respawn(this.carSpawn.clone().setY(this.carSpawn.y + 1), this.edgeInwardDir(this.carSpawnEdge));
       this.car.mesh.visible = true;
     } else if (this.activeTransport === "train") {
-      this.train.respawn(this.trainSpawn);
+      this.train.respawn(this.trainSpawn, this.edgeInwardDir(this.trainSpawnEdge));
       this.train.mesh.visible = true;
     } else {
-      this.ship.respawn(this.shipSpawn.clone().setY(this.terrain.waterMesh.position.y));
+      this.ship.respawn(this.shipSpawn.clone().setY(this.terrain.waterMesh.position.y), this.edgeInwardDir(this.shipSpawnEdge));
       this.ship.mesh.visible = true;
     }
     this.refreshPath();
@@ -508,13 +495,13 @@ export class Game {
     this.ship.mesh.visible = false;
 
     if (this.activeTransport === "car") {
-      this.carTarget = this.pickTargetPoint(this.carSpawn, this.carSpawnEdge);
+      this.carTarget = this.pickTargetPoint(this.carSpawnEdge);
       this.roads.setEndpoints(this.carSpawn, this.carTarget);
     } else if (this.activeTransport === "train") {
-      this.trainTarget = this.pickTargetPoint(this.trainSpawn, this.trainSpawnEdge);
+      this.trainTarget = this.pickTargetPoint(this.trainSpawnEdge);
       this.tracks.setEndpoints(this.trainSpawn, this.trainTarget);
     } else {
-      this.shipTarget = this.pickTargetPoint(this.shipSpawn, this.shipSpawnEdge);
+      this.shipTarget = this.pickTargetPoint(this.shipSpawnEdge);
       this.canals.setEndpoints(this.shipSpawn, this.shipTarget);
     }
 

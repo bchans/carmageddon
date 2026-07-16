@@ -77,11 +77,13 @@ export class Train {
     return this.follower.hasPath;
   }
 
-  respawn(position: THREE.Vector3): void {
+  /** `facingDir` (world-space, horizontal) orients the train to face that direction instead of the default identity rotation — used at round start so it faces into the map from its edge spawn point instead of an arbitrary heading. */
+  respawn(position: THREE.Vector3, facingDir?: THREE.Vector3): void {
     this.position.copy(position);
     this.mesh.position.copy(position);
-    this.quaternion.identity();
-    this.mesh.quaternion.identity();
+    if (facingDir) this.quaternion.setFromUnitVectors(FORWARD, facingDir);
+    else this.quaternion.identity();
+    this.mesh.quaternion.copy(this.quaternion);
   }
 
   /** Advances along the path; returns true once it has just reached the final waypoint. */

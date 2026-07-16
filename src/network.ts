@@ -387,13 +387,16 @@ export abstract class TileNetwork<TKind extends string> {
     if (this.tiles.has(cellKey(cell))) return false; // already a tile there
     if (Math.abs(cell.col * TILE_SIZE) > this.terrain.worldSize / 2 - TILE_SIZE) return false;
     if (Math.abs(cell.row * TILE_SIZE) > this.terrain.worldSize / 2 - TILE_SIZE) return false;
+    // A cell already claimed by a different transport's network blocks this one —
+    // the player has to route around it, same as any other obstacle. Checked
+    // unconditionally, even at this network's own spawn/target cell: an edge
+    // point that happens to land on a cell another transport already built on
+    // must stay off-limits too, not just interior cells.
+    if (!this.isCellFree(cell)) return false;
     const isEndpoint =
       (cell.col === this.spawnCell.col && cell.row === this.spawnCell.row) ||
       (cell.col === this.targetCell.col && cell.row === this.targetCell.row);
     if (!isEndpoint && this.incomingDirection(cell) === null) return false;
-    // A cell already claimed by a different transport's network blocks this one —
-    // the player has to route around it, same as any other obstacle.
-    if (!isEndpoint && !this.isCellFree(cell)) return false;
     return true;
   }
 

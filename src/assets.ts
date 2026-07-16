@@ -25,12 +25,17 @@ export interface ShipAssets {
   boat: THREE.Object3D;
 }
 
+export interface CanalAssets {
+  buoy: THREE.Object3D;
+}
+
 export interface AssetLibrary {
   carScene: THREE.Object3D;
   road: RoadAssets;
   track: TrackAssets;
   train: TrainAssets;
   ship: ShipAssets;
+  canal: CanalAssets;
 }
 
 const loader = new GLTFLoader();
@@ -73,6 +78,7 @@ export async function loadAssets(): Promise<AssetLibrary> {
     locomotive,
     carriage,
     boat,
+    buoy,
   ] = await Promise.all([
     loadGltf(`${base}assets/car/sedan.glb`),
     loadGltf(`${base}assets/road/citybuilder/road-straight.glb`),
@@ -86,6 +92,7 @@ export async function loadAssets(): Promise<AssetLibrary> {
     loadGltf(`${base}assets/train/train-locomotive-a.glb`),
     loadGltf(`${base}assets/train/train-carriage-box.glb`),
     loadGltf(`${base}assets/watercraft/boat-speed-a.glb`),
+    loadGltf(`${base}assets/watercraft/buoy.glb`),
   ]);
 
   // The train kit's track pieces are authored with their origin at one
@@ -102,6 +109,7 @@ export async function loadAssets(): Promise<AssetLibrary> {
     track: { straight: trackStraight, curve: trackCurve },
     train: { locomotive, carriage },
     ship: { boat },
+    canal: { buoy },
   };
 }
 

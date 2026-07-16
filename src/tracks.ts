@@ -26,12 +26,13 @@ export const TRACK_SPEED_MULTIPLIER: Record<TrackKind, number> = {
 const IDENTITY_TINT_TARGET = 0xffffff;
 const IDENTITY_SWATCH: number[] = [1, 1, 1];
 
-// The corner-large template natively (rotationY = 0) connects dirs {1, 2}
-// (E, S) — verified empirically by rendering it at rotationY=0 with tile-edge
-// markers and reading off which two edges its rails actually touched (see
-// the "Wire real Kenney track assets" work — different pivot than the road
-// kit's corner piece, which natively connects {3, 0}).
-const TRACK_CORNER_NATIVE_DIRS: [number, number] = [1, 2];
+// The corner-large template natively (rotationY = 0) connects dirs {0, 1}
+// (N, E) — verified empirically by sampling vertex density near each of the
+// 4 tile-edge midpoints (the only reliable signal for a curve piece; its
+// overall bounding box touches all 4 edges at every rotation, so a bbox-based
+// check can't tell which two edges the track actually lands on) — different
+// pivot than the road kit's corner piece, which natively connects {3, 0}.
+const TRACK_CORNER_NATIVE_DIRS: [number, number] = [0, 1];
 
 function buildStraightTrack(axisIsZ: boolean, pitch: number, trackAssets: TrackAssets): THREE.Object3D {
   return buildKenneyMesh(trackAssets.straight, axisIsZ ? 0 : Math.PI / 2, IDENTITY_TINT_TARGET, IDENTITY_SWATCH, pitch, 1);

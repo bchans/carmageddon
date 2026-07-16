@@ -132,11 +132,18 @@ export class Car {
     }
   }
 
-  respawn(position: THREE.Vector3): void {
+  /** `facingDir` (world-space, horizontal) orients the car to face that direction instead of the default identity rotation — used at round start so it faces into the map from its edge spawn point instead of an arbitrary heading. */
+  respawn(position: THREE.Vector3, facingDir?: THREE.Vector3): void {
     this.chassisBody.setTranslation({ x: position.x, y: position.y, z: position.z }, true);
     this.chassisBody.setLinvel({ x: 0, y: 0, z: 0 }, true);
     this.chassisBody.setAngvel({ x: 0, y: 0, z: 0 }, true);
-    this.chassisBody.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
+    if (facingDir) {
+      // Forward is local -Z (see WHEEL_LOCAL_POSITIONS above).
+      const q = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 0, -1), facingDir);
+      this.chassisBody.setRotation({ x: q.x, y: q.y, z: q.z, w: q.w }, true);
+    } else {
+      this.chassisBody.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
+    }
     this.boostFuel = this.stats.boostCapacity;
   }
 

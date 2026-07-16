@@ -3,7 +3,8 @@ import type RAPIER from "@dimforge/rapier3d-compat";
 import type { Rapier } from "./physics";
 import type { Terrain } from "./terrain";
 import { WATER_LEVEL } from "./terrain";
-import { TileNetwork, TILE_SIZE, type Cell } from "./network";
+import type { CanalAssets } from "./assets";
+import { TileNetwork, type Cell } from "./network";
 
 export const CanalKind = {
   Standard: "standard",
@@ -17,41 +18,47 @@ export const CANAL_SPEED_MULTIPLIER: Record<CanalKind, number> = {
 // How far below the water surface a carved canal bed sits — deep enough that
 // carving through a hill still reliably drops below WATER_LEVEL even after
 // the neighbor-averaging a junction tile's flat height would otherwise do.
+// Every canal tile grades to exactly this depth (see targetFlatHeight below,
+// canals never slope), so a buoy's local y-offset needed to float it at the
+// water surface is this same constant for every tile.
 const CANAL_DEPTH = 1.4;
-
-const postMaterial = new THREE.MeshStandardMaterial({ color: 0xd7c48a, roughness: 0.85 });
+const BUOY_SCALE = 0.55;
 
 /** A canal has no pavement of its own — carving the bed below water level is
  * what makes it visually read as a waterway, since the map already has one
- * continuous water plane. Four low corner posts just mark the channel so a
- * player can see where they've dug before/without a boat sitting on it. */
-function buildCanalMarker(): THREE.Object3D {
+ * continuous water plane. A pair of real Kenney channel buoys at opposite
+ * corners marks the dug channel so a player can see where they've dug
+ * before/without a boat sitting on it. */
+function buildCanalMarker(buoyTemplate: THREE.Object3D): THREE.Object3D {
   const group = new THREE.Group();
-  const postGeo = new THREE.CylinderGeometry(0.03, 0.03, 0.5, 6);
   for (const [x, z] of [
-    [-0.44, -0.44],
-    [0.44, -0.44],
-    [-0.44, 0.44],
-    [0.44, 0.44],
+    [-1.4, -1.4],
+    [1.4, 1.4],
   ]) {
-    const post = new THREE.Mesh(postGeo, postMaterial);
-    post.position.set(x, 0.25, z);
-    post.castShadow = true;
-    group.add(post);
+    const buoy = buoyTemplate.clone(true);
+    buoy.scale.setScalar(BUOY_SCALE);
+    buoy.position.set(x, CANAL_DEPTH, z);
+    buoy.traverse((obj) => {
+      if (obj instanceof THREE.Mesh) obj.castShadow = true;
+    });
+    group.add(buoy);
   }
-  group.scale.setScalar(TILE_SIZE);
   return group;
 }
 
 export class CanalSystem extends TileNetwork<CanalKind> {
+  private readonly canalAssets: CanalAssets;
+
   constructor(
     RAPIER: Rapier,
     world: RAPIER.World,
     terrain: Terrain,
+    canalAssets: CanalAssets,
     isCellFree: (cell: Cell) => boolean,
     claimCell: (cell: Cell) => void,
   ) {
     super(RAPIER, world, terrain, isCellFree, claimCell);
+    this.canalAssets = canalAssets;
   }
 
   protected speedMultiplier(kind: CanalKind): number {
@@ -59,7 +66,7 @@ export class CanalSystem extends TileNetwork<CanalKind> {
   }
 
   protected buildMesh(): THREE.Object3D {
-    return buildCanalMarker();
+    return buildCanalMarker(this.canalAssets.buoy);
   }
 
   // Water has to stay level — a "sloped" canal bed would mean the water
