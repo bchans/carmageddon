@@ -6,10 +6,10 @@ import { Car } from "./car";
 import { RoadSystem, RoadKind, SPEED_MULTIPLIER } from "./roads";
 import { TrackSystem, TrackKind } from "./tracks";
 import { CanalSystem, CanalKind, CANAL_INITIAL_FILL } from "./canals";
-import { TILE_SIZE, DIRS, cellKey, worldToCell, type Cell, type Waypoint } from "./network";
+import { TILE_SIZE, DIRS, cellKey, cellCenter, worldToCell, type Cell, type Waypoint } from "./network";
 import { Train } from "./train";
 import { Ship } from "./ship";
-import { CanalWaterSim } from "./waterSim";
+import { WaterSim } from "./waterSim";
 import { Economy, ROAD_COST, TRACK_COST, CANAL_COST, TOLL_REWARD, SPACE_COST_SCALE } from "./economy";
 import { CameraController, MIN_ZOOM, MAX_ZOOM } from "./input";
 import { Autopilot } from "./autopilot";
@@ -57,7 +57,7 @@ export class Game {
   private roads!: RoadSystem;
   private tracks!: TrackSystem;
   private canals!: CanalSystem;
-  private canalWater = new CanalWaterSim();
+  private waterSim = new WaterSim();
   private economy = new Economy();
   private cameraController!: CameraController;
   private autopilot = new Autopilot();
@@ -127,6 +127,7 @@ export class Game {
     this.tracks = new TrackSystem(this.RAPIER, this.world, this.terrain, assets.track, isCellFree("train"), claimCell("train"));
     this.canals = new CanalSystem(this.RAPIER, this.world, this.terrain, assets.canal, isCellFree("ship"), claimCell("ship"));
     this.scene.add(this.roads.root, this.tracks.root, this.canals.root);
+    this.registerNaturalWaterCells();
 
     this.carSpawnEdge = Math.floor(this.rng() * 4);
     this.carSpawn = this.pickEdgePoint(this.carSpawnEdge);
@@ -340,7 +341,7 @@ export class Game {
         // to a cell center).
         const p = w.position.clone();
         const cell = worldToCell(p.x, p.z);
-        p.y = this.canalWater.getWaterHeight(cell) ?? this.terrain.waterMesh.position.y;
+        p.y = this.waterSim.getWaterHeight(cell) ?? this.terrain.waterMesh.position.y;
         return { position: p, slow: w.slow };
       });
       this.ship.setPath(waypoints);
@@ -351,14 +352,35 @@ export class Game {
     }
   }
 
+  /**
+   * One-time scan (called from start()) registering every tile-grid cell
+   * whose underlying terrain is naturally underwater — the map's lakes/
+   * rivers/coastline — as a fixed-level cell in the same water sim canals
+   * use, so a canal that reaches one of them actually exchanges flow with
+   * it instead of being a disconnected system. Natural terrain outside of
+   * canal-carved cells never changes after generation, so this never needs
+   * to re-run.
+   */
+  private registerNaturalWaterCells(): void {
+    const maxCell = Math.floor((this.terrain.worldSize / 2 - TILE_SIZE / 2) / TILE_SIZE);
+    for (let col = -maxCell; col <= maxCell; col++) {
+      for (let row = -maxCell; row <= maxCell; row++) {
+        const center = cellCenter({ col, row });
+        if (this.terrain.isUnderwaterAt(center.x, center.z)) {
+          this.waterSim.setNaturalCell({ col, row }, this.terrain.waterMesh.position.y);
+        }
+      }
+    }
+  }
+
   /** Resyncs every placed canal tile's live (possibly just-regraded) bed height into the flow sim, steps it, and repositions each tile's water quad to match — the CPU shallow-water simulation behind the canal water surface (see waterSim.ts). */
-  private syncCanalWater(dt: number): void {
+  private syncWaterSim(dt: number): void {
     for (const cell of this.canals.occupiedCells) {
       const bed = this.canals.tileHeight(cell);
-      if (bed !== null) this.canalWater.setBed(cell, bed, CANAL_INITIAL_FILL);
+      if (bed !== null) this.waterSim.setCanalBed(cell, bed, CANAL_INITIAL_FILL);
     }
-    this.canalWater.step(dt);
-    this.canals.updateWaterSurfaces(this.canalWater);
+    this.waterSim.step(dt);
+    this.canals.updateWaterSurfaces(this.waterSim);
   }
 
   private onTap(clientX: number, clientY: number): void {
@@ -435,7 +457,7 @@ export class Game {
   };
 
   private stepPhysics(dt: number): void {
-    this.syncCanalWater(dt);
+    this.syncWaterSim(dt);
 
     if (!this.vehicleActive) {
       this.buildTimer -= dt;
@@ -491,7 +513,7 @@ export class Game {
       this.train.mesh.visible = true;
     } else {
       const spawnCell = worldToCell(this.shipSpawn.x, this.shipSpawn.z);
-      const spawnY = this.canalWater.getWaterHeight(spawnCell) ?? this.terrain.waterMesh.position.y;
+      const spawnY = this.waterSim.getWaterHeight(spawnCell) ?? this.terrain.waterMesh.position.y;
       this.ship.respawn(this.shipSpawn.clone().setY(spawnY), this.edgeInwardDir(this.shipSpawnEdge));
       this.ship.mesh.visible = true;
     }

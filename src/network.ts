@@ -330,6 +330,10 @@ export abstract class TileNetwork<TKind extends string> {
   protected extraEdges(_cell: Cell, _kind: TKind, _facing: number): Array<{ cell: Cell; weight: number }> {
     return [];
   }
+  /** Whether pathfinding may traverse from `from` to `to` (already-confirmed orthogonal network neighbors). Default always allows it; a canal blocks the direction that would mean climbing up a waterfall. */
+  protected canTraverseEdge(_from: Cell, _to: Cell): boolean {
+    return true;
+  }
   /** Facing for a newly placed tile, given the direction its network neighbor lies in. Default points away from the connection (e.g. a ramp launches away from where you drove in). */
   protected facingForPlacement(incoming: number): number {
     return (incoming + 2) % 4;
@@ -638,6 +642,7 @@ export abstract class TileNetwork<TKind extends string> {
     for (const { dc, dr } of DIRS) {
       const neighbor = { col: cell.col + dc, row: cell.row + dr };
       if (!this.isNetworkCell(neighbor)) continue;
+      if (!this.canTraverseEdge(cell, neighbor)) continue;
       const kind = this.tiles.get(cellKey(neighbor))?.kind;
       const speed = kind ? this.speedMultiplier(kind) : 1;
       edges.push({ cell: neighbor, weight: TILE_SIZE / speed });

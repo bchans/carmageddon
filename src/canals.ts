@@ -5,7 +5,7 @@ import type { Terrain } from "./terrain";
 import { WATER_LEVEL } from "./terrain";
 import type { CanalAssets } from "./assets";
 import { TileNetwork, type Cell } from "./network";
-import type { CanalWaterSim } from "./waterSim";
+import { WATERFALL_BED_THRESHOLD, type WaterSim } from "./waterSim";
 
 export const CanalKind = {
   Standard: "standard",
@@ -112,11 +112,22 @@ export class CanalSystem extends TileNetwork<CanalKind> {
     return false;
   }
 
+  /** A ship can ride a waterfall down but never climb one — blocks exactly
+   * the direction that would mean going from a lower bed to a much higher
+   * one, mirroring how the water sim itself treats the same drop as a
+   * one-way cascade instead of two pools equalizing into each other. */
+  protected canTraverseEdge(from: Cell, to: Cell): boolean {
+    const bedFrom = this.tileHeight(from);
+    const bedTo = this.tileHeight(to);
+    if (bedFrom === null || bedTo === null) return true;
+    return bedTo - bedFrom <= WATERFALL_BED_THRESHOLD;
+  }
+
   /** Repositions each tile's water quad to the flow sim's live simulated
    * surface height for that cell, falling back to the tile's own seed fill
    * if the sim hasn't got a reading yet (e.g. the very first tick after
    * placement, before Game has synced it in). */
-  updateWaterSurfaces(sim: CanalWaterSim): void {
+  updateWaterSurfaces(sim: WaterSim): void {
     for (const [key, quad] of this.waterQuads) {
       const tile = this.tiles.get(key);
       if (!tile) continue;
