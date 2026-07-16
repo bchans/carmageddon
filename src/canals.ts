@@ -112,23 +112,28 @@ export class CanalSystem extends TileNetwork<CanalKind> {
     return this.waterField.isNavigable(center.x, center.z);
   }
 
-  /** A ship can ride a waterfall down but never climb one — blocks exactly
-   * the direction that would mean going from a lower bed to a much higher
-   * one. Purely a pathfinding rule; the water itself doesn't need this
-   * distinction; see WATERFALL_BED_THRESHOLD above. */
+  /**
+   * A ship can only sail into a cell that's actually wet — placing a canal
+   * tile just carves a trench (see targetFlatHeight/canSlope above); the
+   * water arriving there is purely a consequence of WaterField's own flow
+   * simulation, which takes a moment to actually flow in once a dig
+   * connects to a real water source. Routing through a dry trench would
+   * mean the ship visibly sails on bare ground. Exempts the ship's actual
+   * spawn/target (always a dry-land edge point — a dock, not a water
+   * cell) so the route can still start and end there. Also still blocks a
+   * ship riding a waterfall down but never climbing one — the direction
+   * that would mean going from a lower bed to a much higher one.
+   */
   protected canTraverseEdge(from: Cell, to: Cell): boolean {
     const bedFrom = this.tileHeight(from);
     const bedTo = this.tileHeight(to);
-    if (bedFrom === null || bedTo === null) return true;
-    return bedTo - bedFrom <= WATERFALL_BED_THRESHOLD;
-  }
+    if (bedFrom !== null && bedTo !== null && bedTo - bedFrom > WATERFALL_BED_THRESHOLD) return false;
 
-  /** Every time a canal tile's bed is graded (placed, or re-graded as a
-   * neighbor changes), tell WaterField this exact footprint was actually
-   * dug — the only way a cell becomes eligible to hold water at all. Roads
-   * and tracks share the same underlying grading call but never override
-   * this, so paving them can't spawn a puddle. */
-  protected onGraded(center: THREE.Vector3, halfSize: number): void {
-    this.waterField.markExcavated(center.x, center.z, halfSize);
+    const isEndpoint = (to.col === this.spawnCell.col && to.row === this.spawnCell.row) ||
+      (to.col === this.targetCell.col && to.row === this.targetCell.row);
+    if (isEndpoint) return true;
+
+    const center = cellCenter(to);
+    return this.waterField.isNavigable(center.x, center.z);
   }
 }

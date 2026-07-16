@@ -15,11 +15,6 @@ function idx(iy: number, ix: number): number {
 // still converging fast enough that a stable pool reads as "full" almost
 // immediately.
 const SEA_RELAX_RATE = 2.2;
-// Caps how deep a dug-into-a-hillside pool can read as, regardless of how
-// much taller the original undisturbed ground there was — a canal cut
-// through a mountain shouldn't pool as a multi-unit-deep slab just because
-// the hill was tall.
-const MAX_DUG_POOL_DEPTH = 2.5;
 // Fraction of the surface-height (bed + depth) difference between two
 // neighboring cells exchanged per second — this alone is what produces a
 // visible waterfall: a cell whose bed pokes up above WATER_LEVEL gets no
@@ -52,18 +47,22 @@ const WATER_MATERIAL_PARAMS = {
  * other terrain edit) and a water depth above it, and the same two rules
  * govern all of it:
  *
- *  1. A cell gently relaxes towards being filled up to whichever is higher:
- *     global sea level, or its own original undisturbed ground height (but
- *     only once markExcavated() has actually flagged the cell as dug — see
- *     below). This alone is what makes the ocean, a lake, and a freshly-dug
- *     canal all read as "full" the same way, with no special-casing between
- *     them — natural low terrain fills via the sea-level rule, and anywhere
- *     a canal has actually dug below its own original grade fills too,
- *     regardless of that hillside's absolute elevation.
+ *  1. A cell that was *naturally* underwater at world generation (a lake,
+ *     river, or the ocean — never a placed road/track/canal, see
+ *     originalHeights below) gently relaxes towards being filled up to
+ *     global sea level. This is the only self-sourcing rule in the whole
+ *     simulation — the one legitimate "infinite reservoir" in the game.
  *  2. Neighbor-to-neighbor diffusion, driven purely by the surface-height
- *     difference between adjacent cells, connects everything together and
- *     produces real waterfalls wherever the bed climbs faster than it was
- *     actually dug (see FLOW_RATE above).
+ *     difference between adjacent cells and capped by what the upstream
+ *     side actually holds, connects everything together. This is the
+ *     *only* way any other cell — including a freshly-dug canal, no
+ *     matter how deep — ever gets water: it has to flow in from an
+ *     already-wet neighbor, exactly like a real dug channel only fills
+ *     once it's actually connected to a water source. A climbing stretch
+ *     thins out and follows the bed contour (a real cascade) instead of
+ *     pooling, and an isolated, not-yet-connected dig just stays dry —
+ *     placing a canal tile carves a trench, nothing more; the water
+ *     arriving there is purely a consequence of rule 2.
  *
  * Rendered as one continuous mesh built straight from the same grid — no
  * per-tile quads, no static "sea level" plane.
@@ -72,25 +71,18 @@ const WATER_MATERIAL_PARAMS = {
  * the exact same Terrain.flattenForRoad mechanism a canal digs its bed
  * with (see TileNetwork.gradeCell), and that grading can genuinely dip a
  * hair below the original bumpy terrain too (e.g. a junction flattening to
- * the average of uneven neighbors) — without markExcavated() gating rule 1,
- * ordinary pavement would start spawning puddles wherever that happened.
+ * the average of uneven neighbors). Gating rule 1 on the terrain's original
+ * generated height rather than its current height is what keeps that from
+ * spawning a puddle: a road/track tile only self-sources water if the
+ * ground was already a lake/river there before anything was ever built.
  */
 export class WaterField {
   private readonly terrain: Terrain;
   /** A one-time snapshot of the terrain's generated (pre-any-dig) heights,
    * taken here in the constructor before any road/track/canal exists to
-   * grade anything. This is what lets a canal dug into a hillside — bed
-   * still above global sea level — hold water too: relax() below fills a
-   * cell towards whichever is higher, sea level or its own original
-   * undisturbed ground height, so digging anywhere exposes water relative
-   * to what was actually excavated, the same way a real dug pit fills with
-   * groundwater regardless of the hill's absolute elevation. */
+   * grade anything. This is the sole thing that distinguishes "a real lake"
+   * from "a hole someone dug" — see rule 1 above. */
   private readonly originalHeights: Float32Array;
-  /** 1 where a canal has actually dug — set only via markExcavated(), never
-   * inferred from height alone, so ordinary road/track grading (which uses
-   * the identical Terrain.flattenForRoad plumbing but isn't a waterway)
-   * can dip below the original terrain without spawning a puddle. */
-  private readonly excavated: Uint8Array;
   private depth: Float32Array;
   private scratch: Float32Array;
   private readonly positions: Float32Array;
@@ -100,13 +92,13 @@ export class WaterField {
   constructor(terrain: Terrain) {
     this.terrain = terrain;
     this.originalHeights = terrain.heights.slice();
-    this.excavated = new Uint8Array(GRID * GRID);
     this.depth = new Float32Array(GRID * GRID);
     this.scratch = new Float32Array(GRID * GRID);
 
     // Seed every naturally-submerged cell full at generation, so lakes,
     // rivers, and the ocean edge look right from the very first frame
-    // instead of waiting for the relax pass to catch up.
+    // instead of waiting for the relax pass to catch up. (Equivalent to
+    // gating on originalHeights here, since nothing has been graded yet.)
     for (let i = 0; i < GRID * GRID; i++) {
       this.depth[i] = Math.max(0, WATER_LEVEL - terrain.heights[i]);
     }
@@ -133,24 +125,15 @@ export class WaterField {
     const next = this.scratch;
     next.set(depth);
 
-    // Pass 1: relax towards being filled. A cell's fill target is whichever
-    // is higher: global sea level (the natural-lake/ocean/river rule), or
-    // its own original undisturbed ground height (the "digging exposes
-    // groundwater" rule — capped at MAX_DUG_POOL_DEPTH so an isolated canal
-    // tile carved into a tall hillside doesn't pool absurdly deep). A cell
-    // whose *current* bed is already at or above both never gets this term
-    // at all, so whatever depth it holds (if any) came purely from flowing
-    // in from a neighbor and can flow back out again — that's what makes a
-    // climbing, ungraded stretch of canal read as a real cascade instead of
-    // a pool.
+    // Pass 1: relax towards being filled — but only for a cell that was
+    // *naturally* underwater at generation (see originalHeights). A dug
+    // cell — road, track, or canal, doesn't matter, and regardless of how
+    // far below sea level it was carved — gets nothing here; whatever
+    // depth it holds came purely from Pass 2 flowing in from a neighbor,
+    // and can flow back out again just as easily.
     for (let i = 0; i < heights.length; i++) {
-      const bed = heights[i];
-      const seaTarget = Math.max(0, WATER_LEVEL - bed);
-      const dugTarget = this.excavated[i]
-        ? Math.min(MAX_DUG_POOL_DEPTH, Math.max(0, this.originalHeights[i] - bed))
-        : 0;
-      const target = Math.max(seaTarget, dugTarget);
-      if (target <= 0) continue;
+      if (this.originalHeights[i] >= WATER_LEVEL) continue;
+      const target = Math.max(0, WATER_LEVEL - heights[i]);
       next[i] += (target - next[i]) * Math.min(1, SEA_RELAX_RATE * dt);
     }
 
@@ -227,27 +210,6 @@ export class WaterField {
   isNavigable(x: number, z: number): boolean {
     if (Math.abs(x) > TERRAIN_SIZE / 2 || Math.abs(z) > TERRAIN_SIZE / 2) return false;
     return this.depthAt(x, z) >= NAVIGABLE_DEPTH;
-  }
-
-  /**
-   * Flags every grid vertex within the given world-space footprint as
-   * excavated — the only way a cell becomes eligible for the "digging
-   * exposes groundwater" fill rule in step(). Called by CanalSystem after
-   * grading a canal tile's bed (see TileNetwork.onGraded); never called by
-   * roads or tracks, so paving them can't accidentally spawn puddles.
-   */
-  markExcavated(centerX: number, centerZ: number, halfSize: number): void {
-    const cix = Math.round((centerX + TERRAIN_SIZE / 2) / SPACING);
-    const ciy = Math.round((centerZ + TERRAIN_SIZE / 2) / SPACING);
-    const radius = Math.max(1, Math.round(halfSize / SPACING));
-    for (let dy = -radius; dy <= radius; dy++) {
-      for (let dx = -radius; dx <= radius; dx++) {
-        const ix = cix + dx;
-        const iy = ciy + dy;
-        if (ix < 0 || ix >= GRID || iy < 0 || iy >= GRID) continue;
-        this.excavated[idx(iy, ix)] = 1;
-      }
-    }
   }
 
   private sampleCoords(x: number, z: number): { ix: number; iy: number; tx: number; tz: number } {

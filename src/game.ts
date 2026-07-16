@@ -441,6 +441,17 @@ export class Game {
   private stepPhysics(dt: number): void {
     this.waterField.step(dt);
 
+    // A canal only becomes routable once WaterField has actually flowed
+    // water into it (see CanalSystem.canTraverseEdge), which can take a
+    // moment after the tile that finally connects it gets placed — so a
+    // single refreshPath() right after placement isn't enough; keep
+    // retrying every tick while the ship genuinely has no path yet. Safe
+    // to call unconditionally here because clearing/re-setting an *empty*
+    // path can't reset any progress there's nothing to lose.
+    if (this.activeTransport === "ship" && !this.ship.hasPath) {
+      this.refreshPath();
+    }
+
     if (!this.vehicleActive) {
       this.buildTimer -= dt;
       this.updateCountdownStatus();
