@@ -6,7 +6,7 @@ const TAP_MOVE_THRESHOLD = 6; // px
 const PAN_SPEED = 0.0016; // world units per screen px per zoom unit
 const KEY_PAN_SPEED = 24; // world units per second at zoom 1, for WASD/arrow-key panning
 const PAN_KEYS = new Set(["w", "a", "s", "d", "arrowup", "arrowdown", "arrowleft", "arrowright"]);
-const ROTATE_SPEED = 0.006; // yaw/pitch radians per screen px, right-drag
+const ROTATE_SPEED = 0.006; // yaw/pitch radians per screen px, middle-drag
 // Pitch offset from the default viewing angle (radians): how far the player
 // can tilt down toward the horizon (positive) or up toward top-down
 // (negative) — clamped so the camera can never dip below the horizon or
@@ -47,16 +47,9 @@ export class CameraController {
     domElement.addEventListener("pointermove", this.onPointerMove);
     window.addEventListener("pointerup", this.onPointerUp);
     domElement.addEventListener("wheel", this.onWheel, { passive: false });
-    domElement.addEventListener("contextmenu", this.onContextMenu);
     window.addEventListener("keydown", this.onKeyDown);
     window.addEventListener("keyup", this.onKeyUp);
   }
-
-  private onContextMenu = (e: MouseEvent): void => {
-    // Right-drag is bound to camera orbit, so suppress the browser's
-    // right-click context menu over the canvas.
-    e.preventDefault();
-  };
 
   private onKeyDown = (e: KeyboardEvent): void => {
     const key = e.key.toLowerCase();
@@ -86,6 +79,9 @@ export class CameraController {
   }
 
   private onPointerDown = (e: PointerEvent): void => {
+    // Suppress the browser's middle-click auto-scroll cursor — middle-drag
+    // is bound to camera orbit instead.
+    if (e.button === 1) e.preventDefault();
     this.domElement.setPointerCapture(e.pointerId);
     this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY, button: e.button });
     this.dragMoved = false;
@@ -114,7 +110,7 @@ export class CameraController {
     if (Math.abs(dx) + Math.abs(dy) > TAP_MOVE_THRESHOLD) this.dragMoved = true;
     if (!this.dragMoved) return;
 
-    if (prev.button === 2) {
+    if (prev.button === 1) {
       this.yaw -= dx * ROTATE_SPEED;
       this.pitchOffset = clamp(this.pitchOffset + dy * ROTATE_SPEED, MIN_PITCH_OFFSET, MAX_PITCH_OFFSET);
     } else {
@@ -153,7 +149,6 @@ export class CameraController {
     this.domElement.removeEventListener("pointermove", this.onPointerMove);
     window.removeEventListener("pointerup", this.onPointerUp);
     this.domElement.removeEventListener("wheel", this.onWheel);
-    this.domElement.removeEventListener("contextmenu", this.onContextMenu);
     window.removeEventListener("keydown", this.onKeyDown);
     window.removeEventListener("keyup", this.onKeyUp);
   }
