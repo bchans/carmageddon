@@ -3,8 +3,15 @@ import { RoadKind } from "./roads";
 import { TrackKind } from "./tracks";
 import { CanalKind } from "./canals";
 
-export const STARTING_CURRENCY = 40;
-export const TOLL_REWARD = 28;
+// Every round now connects two full map edges (see Game.pickTargetPoint),
+// which measured out to a ~13-tile median and ~23-tile worst-case straight-
+// line distance across 200 sampled rounds — these two numbers are sized so
+// a median-distance round is affordable in the *priciest* single-tile-kind
+// network (canals, which — unlike roads — have no cheap fallback kind), with
+// enough headroom that a rough p75 round doesn't leave the player stuck
+// before they've ever completed a toll and earned anything.
+export const STARTING_CURRENCY = 200;
+export const TOLL_REWARD = 50;
 
 export const ROAD_COST: Record<RoadKind, number> = {
   [RoadKind.Standard]: 6,
@@ -15,13 +22,15 @@ export const ROAD_COST: Record<RoadKind, number> = {
 };
 
 export const TRACK_COST: Record<TrackKind, number> = {
-  [TrackKind.Standard]: 7,
+  [TrackKind.Standard]: 6,
 };
 
 // Digging a canal bed is pricier than laying pavement/rail on ground that's
-// already there.
+// already there, but tracks/canals — unlike roads — have no cheap "Mud"-style
+// fallback kind, so this can't run as far ahead of the road/track cost as it
+// used to without risking an unrecoverable first round.
 export const CANAL_COST: Record<CanalKind, number> = {
-  [CanalKind.Standard]: 10,
+  [CanalKind.Standard]: 7,
 };
 
 // How much every build cost scales up as the map fills up (see Game's

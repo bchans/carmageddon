@@ -5,10 +5,11 @@ import { Terrain } from "./terrain";
 import { Car } from "./car";
 import { RoadSystem, RoadKind, SPEED_MULTIPLIER } from "./roads";
 import { TrackSystem, TrackKind } from "./tracks";
-import { CanalSystem, CanalKind } from "./canals";
+import { CanalSystem, CanalKind, CANAL_INITIAL_FILL } from "./canals";
 import { TILE_SIZE, DIRS, cellKey, worldToCell, type Cell, type Waypoint } from "./network";
 import { Train } from "./train";
 import { Ship } from "./ship";
+import { CanalWaterSim } from "./waterSim";
 import { Economy, ROAD_COST, TRACK_COST, CANAL_COST, TOLL_REWARD, SPACE_COST_SCALE } from "./economy";
 import { CameraController, MIN_ZOOM, MAX_ZOOM } from "./input";
 import { Autopilot } from "./autopilot";
@@ -17,7 +18,10 @@ import { loadAssets, applyMaxAnisotropy } from "./assets";
 
 const FIXED_DT = 1 / 60;
 const TARGET_REACHED_RADIUS = TILE_SIZE * 1.1;
-const SPAWN_MARGIN = 5;
+// Matches TileNetwork.canPlace's own edge margin (TILE_SIZE / 2) so a spawn/
+// target edge point always lands exactly on the outermost buildable tile
+// ring, instead of sitting a tile or more inside of it.
+const SPAWN_MARGIN = TILE_SIZE / 2;
 const BUILD_TIME = 24; // seconds of build time before the vehicle departs each round
 
 const CAMERA_BASE_HEIGHT = 70;
@@ -53,6 +57,7 @@ export class Game {
   private roads!: RoadSystem;
   private tracks!: TrackSystem;
   private canals!: CanalSystem;
+  private canalWater = new CanalWaterSim();
   private economy = new Economy();
   private cameraController!: CameraController;
   private autopilot = new Autopilot();
@@ -326,10 +331,16 @@ export class Game {
     if (path) {
       const waypoints = this.canals.buildWaypoints(path, this.shipSpawn, this.shipTarget).map((w): Waypoint => {
         // A canal's own graded height is its carved bed, not the water
-        // surface it floats on — the ship rides at a fixed water-level
-        // height along its route instead of sinking to the bed.
+        // surface it floats on — the ship rides the locally simulated water
+        // height for whichever cell this waypoint sits over (see
+        // waterSim.ts), so it actually follows a sloped/varying canal
+        // instead of one constant level. Falls back to the global sea-level
+        // plane for a waypoint over a cell the sim has no reading for yet
+        // (the exact spawn/target points, which aren't necessarily snapped
+        // to a cell center).
         const p = w.position.clone();
-        p.y = this.terrain.waterMesh.position.y;
+        const cell = worldToCell(p.x, p.z);
+        p.y = this.canalWater.getWaterHeight(cell) ?? this.terrain.waterMesh.position.y;
         return { position: p, slow: w.slow };
       });
       this.ship.setPath(waypoints);
@@ -338,6 +349,16 @@ export class Game {
       this.ship.clearPath();
       this.hud.setStatus("No route yet — dig a canal to continue");
     }
+  }
+
+  /** Resyncs every placed canal tile's live (possibly just-regraded) bed height into the flow sim, steps it, and repositions each tile's water quad to match — the CPU shallow-water simulation behind the canal water surface (see waterSim.ts). */
+  private syncCanalWater(dt: number): void {
+    for (const cell of this.canals.occupiedCells) {
+      const bed = this.canals.tileHeight(cell);
+      if (bed !== null) this.canalWater.setBed(cell, bed, CANAL_INITIAL_FILL);
+    }
+    this.canalWater.step(dt);
+    this.canals.updateWaterSurfaces(this.canalWater);
   }
 
   private onTap(clientX: number, clientY: number): void {
@@ -414,6 +435,8 @@ export class Game {
   };
 
   private stepPhysics(dt: number): void {
+    this.syncCanalWater(dt);
+
     if (!this.vehicleActive) {
       this.buildTimer -= dt;
       this.updateCountdownStatus();
@@ -467,7 +490,9 @@ export class Game {
       this.train.respawn(this.trainSpawn, this.edgeInwardDir(this.trainSpawnEdge));
       this.train.mesh.visible = true;
     } else {
-      this.ship.respawn(this.shipSpawn.clone().setY(this.terrain.waterMesh.position.y), this.edgeInwardDir(this.shipSpawnEdge));
+      const spawnCell = worldToCell(this.shipSpawn.x, this.shipSpawn.z);
+      const spawnY = this.canalWater.getWaterHeight(spawnCell) ?? this.terrain.waterMesh.position.y;
+      this.ship.respawn(this.shipSpawn.clone().setY(spawnY), this.edgeInwardDir(this.shipSpawnEdge));
       this.ship.mesh.visible = true;
     }
     this.refreshPath();

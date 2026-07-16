@@ -385,8 +385,15 @@ export abstract class TileNetwork<TKind extends string> {
 
   canPlace(cell: Cell): boolean {
     if (this.tiles.has(cellKey(cell))) return false; // already a tile there
-    if (Math.abs(cell.col * TILE_SIZE) > this.terrain.worldSize / 2 - TILE_SIZE) return false;
-    if (Math.abs(cell.row * TILE_SIZE) > this.terrain.worldSize / 2 - TILE_SIZE) return false;
+    // Half a tile of headroom (not a full tile) is all a centered tile's own
+    // footprint needs to still fit on the terrain mesh — anything more just
+    // leaves an unusable, unreachable ring around the map that spawn/target
+    // points can never reach either (see SPAWN_MARGIN in game.ts, which
+    // matches this same margin so the outermost buildable ring and the edge
+    // spawn/target points coincide instead of the points sitting a tile or
+    // more inside of what's actually buildable).
+    if (Math.abs(cell.col * TILE_SIZE) > this.terrain.worldSize / 2 - TILE_SIZE / 2) return false;
+    if (Math.abs(cell.row * TILE_SIZE) > this.terrain.worldSize / 2 - TILE_SIZE / 2) return false;
     // A cell already claimed by a different transport's network blocks this one —
     // the player has to route around it, same as any other obstacle. Checked
     // unconditionally, even at this network's own spawn/target cell: an edge
@@ -717,5 +724,11 @@ export abstract class TileNetwork<TKind extends string> {
 
   get occupiedCells(): Cell[] {
     return [...this.tiles.values()].map((t) => t.cell);
+  }
+
+  /** Live pad/bed height of a placed tile, or null if nothing's built at `cell` yet. Lets an external system (e.g. the canal water flow sim) read graded bed heights without duplicating tile state. */
+  tileHeight(cell: Cell): number | null {
+    const tile = this.tiles.get(cellKey(cell));
+    return tile ? tile.centerHeight : null;
   }
 }
