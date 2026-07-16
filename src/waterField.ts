@@ -41,13 +41,68 @@ const PUMP_RATE = 1.5;
 // nowhere for the water to go on its own would just grow forever.
 const PUMP_MAX_DEPTH = 3.0;
 
-const WATER_MATERIAL_PARAMS = {
-  color: 0x2f6fa3,
-  transparent: true,
-  opacity: 0.78,
-  roughness: 0.28,
-  metalness: 0.1,
-} as const;
+// Depth (in world units) at which water is considered "fully deep" for
+// shading purposes — at or beyond this, color/opacity stop changing. Below
+// it, both fade toward the shallow values so a thin film on a slope reads
+// as a thin film instead of full-strength lake color.
+const SHALLOW_REF_DEPTH = 0.45;
+const SHALLOW_COLOR = new THREE.Color(0x6fb2c9);
+const DEEP_COLOR = new THREE.Color(0x1f5a86);
+const MIN_ALPHA = 0.12;
+const MAX_ALPHA = 0.82;
+
+function createWaterMaterial(): THREE.MeshStandardMaterial {
+  const material = new THREE.MeshStandardMaterial({
+    transparent: true,
+    roughness: 0.28,
+    metalness: 0.1,
+  });
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.shallowColor = { value: SHALLOW_COLOR };
+    shader.uniforms.deepColor = { value: DEEP_COLOR };
+    shader.uniforms.shallowRefDepth = { value: SHALLOW_REF_DEPTH };
+    shader.uniforms.minAlpha = { value: MIN_ALPHA };
+    shader.uniforms.maxAlpha = { value: MAX_ALPHA };
+
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        "#include <common>",
+        "#include <common>\nattribute float waterDepth;\nvarying float vWaterDepth;",
+      )
+      .replace(
+        "#include <begin_vertex>",
+        "#include <begin_vertex>\nvWaterDepth = waterDepth;",
+      );
+
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        "#include <common>",
+        [
+          "#include <common>",
+          "varying float vWaterDepth;",
+          "uniform vec3 shallowColor;",
+          "uniform vec3 deepColor;",
+          "uniform float shallowRefDepth;",
+          "uniform float minAlpha;",
+          "uniform float maxAlpha;",
+        ].join("\n"),
+      )
+      .replace(
+        "#include <color_fragment>",
+        [
+          "#include <color_fragment>",
+          "{",
+          "  float depthT = clamp(vWaterDepth / shallowRefDepth, 0.0, 1.0);",
+          "  diffuseColor.rgb = mix(shallowColor, deepColor, depthT);",
+          "  float grazing = 1.0 - clamp(dot(normalize(vNormal), normalize(vViewPosition)), 0.0, 1.0);",
+          "  float fresnel = pow(grazing, 3.0);",
+          "  diffuseColor.a = clamp(mix(minAlpha, maxAlpha, depthT) + fresnel * 0.25, 0.0, 1.0);",
+          "}",
+        ].join("\n"),
+      );
+  };
+  return material;
+}
 
 /**
  * The single water system in the game: one height-field flow simulation
@@ -97,6 +152,7 @@ export class WaterField {
   private scratch: Float32Array;
   private readonly positions: Float32Array;
   private readonly normals: Float32Array;
+  private readonly vertexDepths: Float32Array;
   /** Active pumps as resolved grid-vertex index pairs (resolved once at
    * registration, since a pump's cell never moves) — see registerPump(). */
   private readonly pumps: Array<{ fromIdx: number; toIdx: number }> = [];
@@ -120,13 +176,16 @@ export class WaterField {
     // 2 triangles * 3 vertices * 3 floats per quad.
     this.positions = new Float32Array(maxQuads * 18);
     this.normals = new Float32Array(maxQuads * 18);
+    // 2 triangles * 3 vertices * 1 float per quad.
+    this.vertexDepths = new Float32Array(maxQuads * 6);
 
     const geometry = new THREE.BufferGeometry();
     geometry.setAttribute("position", new THREE.BufferAttribute(this.positions, 3));
     geometry.setAttribute("normal", new THREE.BufferAttribute(this.normals, 3));
+    geometry.setAttribute("waterDepth", new THREE.BufferAttribute(this.vertexDepths, 1));
     geometry.setDrawRange(0, 0);
 
-    this.mesh = new THREE.Mesh(geometry, new THREE.MeshStandardMaterial(WATER_MATERIAL_PARAMS));
+    this.mesh = new THREE.Mesh(geometry, createWaterMaterial());
     this.mesh.receiveShadow = true;
     this.rebuildMesh();
   }
@@ -326,7 +385,9 @@ export class WaterField {
     const heights = this.terrain.heights;
     const depth = this.depth;
     const pos = this.positions;
+    const vdepth = this.vertexDepths;
     let offset = 0;
+    let depthOffset = 0;
 
     for (let iy = 0; iy < GRID - 1; iy++) {
       for (let ix = 0; ix < GRID - 1; ix++) {
@@ -352,6 +413,8 @@ export class WaterField {
         // Two triangles wound so their normal faces +Y: SW,NE,SE then SW,NW,NE.
         offset = writeTri(pos, offset, x0, y00, z0, x1, y11, z1, x1, y10, z0);
         offset = writeTri(pos, offset, x0, y00, z0, x0, y01, z1, x1, y11, z1);
+        depthOffset = writeTriScalar(vdepth, depthOffset, d00, d11, d10);
+        depthOffset = writeTriScalar(vdepth, depthOffset, d00, d01, d11);
       }
     }
 
@@ -361,6 +424,7 @@ export class WaterField {
     geometry.setDrawRange(0, offset / 3);
     geometry.computeVertexNormals();
     (geometry.attributes.normal as THREE.BufferAttribute).needsUpdate = true;
+    (geometry.attributes.waterDepth as THREE.BufferAttribute).needsUpdate = true;
     geometry.computeBoundingSphere();
   }
 }
@@ -376,4 +440,11 @@ function writeTri(
   pos[offset + 3] = bx; pos[offset + 4] = by; pos[offset + 5] = bz;
   pos[offset + 6] = cx; pos[offset + 7] = cy; pos[offset + 8] = cz;
   return offset + 9;
+}
+
+function writeTriScalar(arr: Float32Array, offset: number, a: number, b: number, c: number): number {
+  arr[offset] = a;
+  arr[offset + 1] = b;
+  arr[offset + 2] = c;
+  return offset + 3;
 }

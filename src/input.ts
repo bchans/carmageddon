@@ -6,6 +6,13 @@ const TAP_MOVE_THRESHOLD = 6; // px
 const PAN_SPEED = 0.0016; // world units per screen px per zoom unit
 const KEY_PAN_SPEED = 24; // world units per second at zoom 1, for WASD/arrow-key panning
 const PAN_KEYS = new Set(["w", "a", "s", "d", "arrowup", "arrowdown", "arrowleft", "arrowright"]);
+const ROTATE_SPEED = 0.006; // yaw/pitch radians per screen px, right-drag
+// Pitch offset from the default viewing angle (radians): how far the player
+// can tilt down toward the horizon (positive) or up toward top-down
+// (negative) — clamped so the camera can never dip below the horizon or
+// flip past straight-down.
+export const MIN_PITCH_OFFSET = -0.65;
+export const MAX_PITCH_OFFSET = 0.85;
 
 export interface CameraControllerCallbacks {
   onTap: (clientX: number, clientY: number) => void;
@@ -20,8 +27,12 @@ export interface CameraControllerCallbacks {
 export class CameraController {
   readonly panOffset = new THREE.Vector2(0, 0);
   zoom = 1;
+  /** Horizontal orbit angle around the look-at point, radians, free-spinning. */
+  yaw = 0;
+  /** Vertical tilt offset from the default viewing angle, radians, clamped. */
+  pitchOffset = 0;
 
-  private activePointers = new Map<number, { x: number; y: number }>();
+  private activePointers = new Map<number, { x: number; y: number; button: number }>();
   private dragMoved = false;
   private pinchStartDist = 0;
   private pinchStartZoom = 1;
@@ -36,9 +47,16 @@ export class CameraController {
     domElement.addEventListener("pointermove", this.onPointerMove);
     window.addEventListener("pointerup", this.onPointerUp);
     domElement.addEventListener("wheel", this.onWheel, { passive: false });
+    domElement.addEventListener("contextmenu", this.onContextMenu);
     window.addEventListener("keydown", this.onKeyDown);
     window.addEventListener("keyup", this.onKeyUp);
   }
+
+  private onContextMenu = (e: MouseEvent): void => {
+    // Right-drag is bound to camera orbit, so suppress the browser's
+    // right-click context menu over the canvas.
+    e.preventDefault();
+  };
 
   private onKeyDown = (e: KeyboardEvent): void => {
     const key = e.key.toLowerCase();
@@ -69,7 +87,7 @@ export class CameraController {
 
   private onPointerDown = (e: PointerEvent): void => {
     this.domElement.setPointerCapture(e.pointerId);
-    this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY, button: e.button });
     this.dragMoved = false;
     if (this.activePointers.size === 2) {
       this.pinchStartDist = this.currentPinchDistance();
@@ -81,7 +99,7 @@ export class CameraController {
     const prev = this.activePointers.get(e.pointerId);
     this.callbacks.onHover(e.clientX, e.clientY);
     if (!prev) return;
-    this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    this.activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY, button: prev.button });
 
     if (this.activePointers.size === 2) {
       const dist = this.currentPinchDistance();
@@ -94,7 +112,12 @@ export class CameraController {
     const dx = e.clientX - prev.x;
     const dy = e.clientY - prev.y;
     if (Math.abs(dx) + Math.abs(dy) > TAP_MOVE_THRESHOLD) this.dragMoved = true;
-    if (this.dragMoved) {
+    if (!this.dragMoved) return;
+
+    if (prev.button === 2) {
+      this.yaw -= dx * ROTATE_SPEED;
+      this.pitchOffset = clamp(this.pitchOffset + dy * ROTATE_SPEED, MIN_PITCH_OFFSET, MAX_PITCH_OFFSET);
+    } else {
       const scale = PAN_SPEED / this.zoom;
       this.panOffset.x -= dx * scale;
       this.panOffset.y -= dy * scale;
@@ -130,6 +153,7 @@ export class CameraController {
     this.domElement.removeEventListener("pointermove", this.onPointerMove);
     window.removeEventListener("pointerup", this.onPointerUp);
     this.domElement.removeEventListener("wheel", this.onWheel);
+    this.domElement.removeEventListener("contextmenu", this.onContextMenu);
     window.removeEventListener("keydown", this.onKeyDown);
     window.removeEventListener("keyup", this.onKeyUp);
   }

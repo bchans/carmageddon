@@ -28,6 +28,8 @@ const BUILD_TIME = 24; // seconds of build time before the vehicle departs each 
 
 const CAMERA_BASE_HEIGHT = 70;
 const CAMERA_BASE_BACK = 45;
+const CAMERA_BASE_DIST = Math.hypot(CAMERA_BASE_HEIGHT, CAMERA_BASE_BACK);
+const CAMERA_BASE_PITCH = Math.atan2(CAMERA_BASE_HEIGHT, CAMERA_BASE_BACK);
 
 type TransportKind = "car" | "train" | "ship";
 const TRANSPORT_KINDS: TransportKind[] = ["car", "train", "ship"];
@@ -664,7 +666,15 @@ export class Game {
     this.cameraController.clampPan(this.terrain.worldSize / 2 - 10);
     const center = new THREE.Vector3(this.cameraController.panOffset.x, 0, this.cameraController.panOffset.y);
     const zoom = this.cameraController.zoom;
-    this.camera.position.set(center.x, CAMERA_BASE_HEIGHT / zoom, center.z + CAMERA_BASE_BACK / zoom);
+    const dist = CAMERA_BASE_DIST / zoom;
+    const pitch = CAMERA_BASE_PITCH + this.cameraController.pitchOffset;
+    const yaw = this.cameraController.yaw;
+    const horizontal = dist * Math.cos(pitch);
+    this.camera.position.set(
+      center.x + horizontal * Math.sin(yaw),
+      dist * Math.sin(pitch),
+      center.z + horizontal * Math.cos(yaw),
+    );
     this.camera.lookAt(center);
   }
 }
