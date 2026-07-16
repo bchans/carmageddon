@@ -53,11 +53,12 @@ const WATER_MATERIAL_PARAMS = {
  * govern all of it:
  *
  *  1. A cell gently relaxes towards being filled up to whichever is higher:
- *     global sea level, or its own original undisturbed ground height. This
- *     alone is what makes the ocean, a lake, and a freshly-dug canal all
- *     read as "full" the same way, with no special-casing between them —
- *     natural low terrain fills via the sea-level rule, and anywhere a
- *     player has actually dug below its own original grade fills too,
+ *     global sea level, or its own original undisturbed ground height (but
+ *     only once markExcavated() has actually flagged the cell as dug — see
+ *     below). This alone is what makes the ocean, a lake, and a freshly-dug
+ *     canal all read as "full" the same way, with no special-casing between
+ *     them — natural low terrain fills via the sea-level rule, and anywhere
+ *     a canal has actually dug below its own original grade fills too,
  *     regardless of that hillside's absolute elevation.
  *  2. Neighbor-to-neighbor diffusion, driven purely by the surface-height
  *     difference between adjacent cells, connects everything together and
@@ -66,6 +67,13 @@ const WATER_MATERIAL_PARAMS = {
  *
  * Rendered as one continuous mesh built straight from the same grid — no
  * per-tile quads, no static "sea level" plane.
+ *
+ * Roads and train tracks grade their own pad flush with the ground through
+ * the exact same Terrain.flattenForRoad mechanism a canal digs its bed
+ * with (see TileNetwork.gradeCell), and that grading can genuinely dip a
+ * hair below the original bumpy terrain too (e.g. a junction flattening to
+ * the average of uneven neighbors) — without markExcavated() gating rule 1,
+ * ordinary pavement would start spawning puddles wherever that happened.
  */
 export class WaterField {
   private readonly terrain: Terrain;
@@ -78,6 +86,11 @@ export class WaterField {
    * to what was actually excavated, the same way a real dug pit fills with
    * groundwater regardless of the hill's absolute elevation. */
   private readonly originalHeights: Float32Array;
+  /** 1 where a canal has actually dug — set only via markExcavated(), never
+   * inferred from height alone, so ordinary road/track grading (which uses
+   * the identical Terrain.flattenForRoad plumbing but isn't a waterway)
+   * can dip below the original terrain without spawning a puddle. */
+  private readonly excavated: Uint8Array;
   private depth: Float32Array;
   private scratch: Float32Array;
   private readonly positions: Float32Array;
@@ -87,6 +100,7 @@ export class WaterField {
   constructor(terrain: Terrain) {
     this.terrain = terrain;
     this.originalHeights = terrain.heights.slice();
+    this.excavated = new Uint8Array(GRID * GRID);
     this.depth = new Float32Array(GRID * GRID);
     this.scratch = new Float32Array(GRID * GRID);
 
@@ -132,7 +146,9 @@ export class WaterField {
     for (let i = 0; i < heights.length; i++) {
       const bed = heights[i];
       const seaTarget = Math.max(0, WATER_LEVEL - bed);
-      const dugTarget = Math.min(MAX_DUG_POOL_DEPTH, Math.max(0, this.originalHeights[i] - bed));
+      const dugTarget = this.excavated[i]
+        ? Math.min(MAX_DUG_POOL_DEPTH, Math.max(0, this.originalHeights[i] - bed))
+        : 0;
       const target = Math.max(seaTarget, dugTarget);
       if (target <= 0) continue;
       next[i] += (target - next[i]) * Math.min(1, SEA_RELAX_RATE * dt);
@@ -198,6 +214,27 @@ export class WaterField {
   /** Whether there's enough water at (x, z) for a ship to actually float. */
   isNavigable(x: number, z: number): boolean {
     return this.depthAt(x, z) >= NAVIGABLE_DEPTH;
+  }
+
+  /**
+   * Flags every grid vertex within the given world-space footprint as
+   * excavated — the only way a cell becomes eligible for the "digging
+   * exposes groundwater" fill rule in step(). Called by CanalSystem after
+   * grading a canal tile's bed (see TileNetwork.onGraded); never called by
+   * roads or tracks, so paving them can't accidentally spawn puddles.
+   */
+  markExcavated(centerX: number, centerZ: number, halfSize: number): void {
+    const cix = Math.round((centerX + TERRAIN_SIZE / 2) / SPACING);
+    const ciy = Math.round((centerZ + TERRAIN_SIZE / 2) / SPACING);
+    const radius = Math.max(1, Math.round(halfSize / SPACING));
+    for (let dy = -radius; dy <= radius; dy++) {
+      for (let dx = -radius; dx <= radius; dx++) {
+        const ix = cix + dx;
+        const iy = ciy + dy;
+        if (ix < 0 || ix >= GRID || iy < 0 || iy >= GRID) continue;
+        this.excavated[idx(iy, ix)] = 1;
+      }
+    }
   }
 
   private sampleCoords(x: number, z: number): { ix: number; iy: number; tx: number; tz: number } {

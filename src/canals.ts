@@ -122,4 +122,13 @@ export class CanalSystem extends TileNetwork<CanalKind> {
     if (bedFrom === null || bedTo === null) return true;
     return bedTo - bedFrom <= WATERFALL_BED_THRESHOLD;
   }
+
+  /** Every time a canal tile's bed is graded (placed, or re-graded as a
+   * neighbor changes), tell WaterField this exact footprint was actually
+   * dug — the only way a cell becomes eligible to hold water at all. Roads
+   * and tracks share the same underlying grading call but never override
+   * this, so paving them can't spawn a puddle. */
+  protected onGraded(center: THREE.Vector3, halfSize: number): void {
+    this.waterField.markExcavated(center.x, center.z, halfSize);
+  }
 }

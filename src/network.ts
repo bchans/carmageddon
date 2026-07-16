@@ -494,8 +494,18 @@ export abstract class TileNetwork<TKind extends string> {
       flatHeight = this.targetFlatHeight(cell, this.connectionMask(cell));
       this.terrain.flattenForRoad(center.x, center.z, TILE_SIZE / 2, () => flatHeight);
     }
+    this.onGraded(center, TILE_SIZE / 2);
     return { flatHeight, slope };
   }
+
+  /** Hook fired after this cell's ground has been (re-)graded, with the
+   * exact world-space footprint that was touched. Default no-op — only
+   * a canal needs this, to tell WaterField "this footprint was just dug"
+   * so it's eligible to hold water; a road or track flattening its own
+   * pad (which can also dip a hair below the original bumpy terrain,
+   * e.g. a junction averaging uneven neighbors) must NOT trigger that,
+   * or building ordinary pavement would start spawning puddles. */
+  protected onGraded(_center: THREE.Vector3, _halfSize: number): void {}
 
   place(cell: Cell, kind: TKind): boolean {
     if (!this.canPlace(cell)) return false;
