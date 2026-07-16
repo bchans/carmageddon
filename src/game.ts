@@ -15,6 +15,7 @@ import { CameraController, MIN_ZOOM, MAX_ZOOM } from "./input";
 import { Autopilot } from "./autopilot";
 import { Hud, type BuildOption } from "./hud";
 import { loadAssets, applyMaxAnisotropy } from "./assets";
+import { Watchdog } from "./watchdog";
 
 const FIXED_DT = 1 / 60;
 const TARGET_REACHED_RADIUS = TILE_SIZE * 1.1;
@@ -62,6 +63,7 @@ export class Game {
   private cameraController!: CameraController;
   private autopilot = new Autopilot();
   private hud!: Hud;
+  private watchdog = new Watchdog();
 
   // Shared cross-transport grid occupancy — a cell claimed by one network
   // blocks every other network's canPlace(), which is what makes the three
@@ -411,13 +413,29 @@ export class Game {
   private loop = (): void => {
     const dt = Math.min(this.clock.getDelta(), 0.1);
     this.accumulator += dt;
+    let physicsSteps = 0;
     while (this.accumulator >= FIXED_DT) {
       this.stepPhysics(FIXED_DT);
       this.accumulator -= FIXED_DT;
+      physicsSteps++;
     }
     this.cameraController.update(dt);
     this.updateCamera();
     this.renderer.render(this.scene, this.camera);
+
+    this.watchdog.beat({
+      dt,
+      physicsStepsThisFrame: physicsSteps,
+      activeTransport: this.activeTransport,
+      roundNumber: this.roundNumber,
+      vehicleActive: this.vehicleActive,
+      buildTimer: Math.round(this.buildTimer * 10) / 10,
+      roadTiles: this.roads.tileCount,
+      trackTiles: this.tracks.tileCount,
+      canalTiles: this.canals.tileCount,
+      render: { ...this.renderer.info.render },
+      memory: { ...this.renderer.info.memory },
+    });
   };
 
   private stepPhysics(dt: number): void {
