@@ -286,7 +286,13 @@ function carveRiver(heights: Float32Array, isRiver: Uint8Array, rng: () => numbe
     iy = ny;
   }
 
-  const riverWidth = 3.2;
+  // Narrow enough that carving only ever touches a cell or two either side of
+  // the actual bed (radius 2 grid cells ≈ one tile's width, not the ~8-unit
+  // halo the old riverWidth=3.2 dragged flat) — the complaint that water
+  // "levels the ground by quite a lot" traced back to this halo being wide
+  // and its falloff (mere falloff^2) still gentle enough to visibly flatten
+  // a wide swath of surrounding hills, not just cut a believable riverbed.
+  const riverWidth = 2.0;
   for (const [px, py] of path) {
     const radius = Math.ceil(riverWidth);
     for (let dy = -radius; dy <= radius; dy++) {
@@ -299,7 +305,9 @@ function carveRiver(heights: Float32Array, isRiver: Uint8Array, rng: () => numbe
         const falloff = 1 - dist / riverWidth;
         const target = WATER_LEVEL - 0.3;
         const i = idx(ay, ax);
-        heights[i] = THREE.MathUtils.lerp(heights[i], target, falloff * falloff);
+        // Cubed falloff keeps the carve steep and local instead of a broad,
+        // gentle blend into the surrounding terrain.
+        heights[i] = THREE.MathUtils.lerp(heights[i], target, falloff * falloff * falloff);
         if (dist < riverWidth * 0.6) isRiver[i] = 1;
       }
     }
@@ -395,14 +403,20 @@ function buildMesh(heights: Float32Array, isRiver: Uint8Array): THREE.Mesh {
 function buildWater(): THREE.Mesh {
   const geometry = new THREE.PlaneGeometry(TERRAIN_SIZE * 1.02, TERRAIN_SIZE * 1.02);
   geometry.rotateX(-Math.PI / 2);
-  const material = new THREE.MeshStandardMaterial({
-    color: 0x2f6fa3,
-    transparent: true,
-    opacity: 0.75,
-    roughness: 0.3,
-    metalness: 0.1,
-  });
-  const mesh = new THREE.Mesh(geometry, material);
+  const mesh = new THREE.Mesh(geometry, WATER_MATERIAL.clone());
   mesh.position.y = WATER_LEVEL;
   return mesh;
 }
+
+// Shared look for every water surface in the game — the natural sea-level
+// plane above and a dug canal's own surface (canals.ts) both clone this, so
+// there's one consistent material instead of two independently-tuned blues
+// that read as separate water systems.
+export const WATER_MATERIAL_PARAMS = {
+  color: 0x2f6fa3,
+  transparent: true,
+  opacity: 0.78,
+  roughness: 0.28,
+  metalness: 0.1,
+} as const;
+const WATER_MATERIAL = new THREE.MeshStandardMaterial(WATER_MATERIAL_PARAMS);

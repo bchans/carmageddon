@@ -158,6 +158,19 @@ export function buildKenneyMesh(
 const CORNER_NATIVE_DIRS: [number, number] = [3, 0];
 const T_JUNCTION_NATIVE_MISSING_DIR = 2;
 
+/**
+ * Rotation step count (each step = 90°) needed to spin a corner-shaped
+ * template — natively connecting `nativeDirs` at rotationY = 0 — around to
+ * instead connect the given `dirs` pair. Shared by every Kenney-style corner
+ * asset (roads, train tracks) so the {0,3} wraparound special-case only has
+ * to be handled correctly once.
+ */
+export function curveRotationSteps(dirs: [number, number], nativeDirs: [number, number]): number {
+  const [a, b] = dirs;
+  const nativeStart = a === 0 && b === 3 ? 3 : a;
+  return (((nativeStart - nativeDirs[0]) % 4) + 4) % 4;
+}
+
 /** Picks straight / curve / T-junction / crossroad shape from a tile's live connectivity mask. */
 export function buildKenneyShapeMesh(
   mask: boolean[],
@@ -177,8 +190,7 @@ export function buildKenneyShapeMesh(
     const [a, b] = dirs;
     const opposite = (a + 2) % 4 === b;
     if (opposite) return buildStraight(a % 2 === 0);
-    const nativeStart = a === 0 && b === 3 ? 3 : a;
-    const steps = (((nativeStart - CORNER_NATIVE_DIRS[0]) % 4) + 4) % 4;
+    const steps = curveRotationSteps([a, b], CORNER_NATIVE_DIRS);
     return buildKenneyMesh(assets.curve, steps * (Math.PI / 2), targetColorHex, swatchLinear);
   }
   if (dirs.length === 3) {
@@ -338,6 +350,16 @@ export abstract class TileNetwork<TKind extends string> {
   protected facingForPlacement(incoming: number): number {
     return (incoming + 2) % 4;
   }
+  /**
+   * A cell that counts as part of the network without ever being placed as a
+   * tile — used by canals so a naturally underwater cell (lake/river) is
+   * already traversable/connectable on its own, the same way a placed tile
+   * is. Default false: roads and tracks only ever have explicitly placed
+   * cells in their network.
+   */
+  protected isExtraNetworkCell(_cell: Cell): boolean {
+    return false;
+  }
 
   /**
    * The network is permanent and persists across rounds — only the
@@ -365,7 +387,8 @@ export abstract class TileNetwork<TKind extends string> {
   private isNetworkCell(cell: Cell): boolean {
     if (cell.col === this.spawnCell.col && cell.row === this.spawnCell.row) return true;
     if (cell.col === this.targetCell.col && cell.row === this.targetCell.row) return true;
-    return this.tiles.has(cellKey(cell));
+    if (this.tiles.has(cellKey(cell))) return true;
+    return this.isExtraNetworkCell(cell);
   }
 
   private connectionMask(cell: Cell): boolean[] {
@@ -389,6 +412,11 @@ export abstract class TileNetwork<TKind extends string> {
 
   canPlace(cell: Cell): boolean {
     if (this.tiles.has(cellKey(cell))) return false; // already a tile there
+    // Already part of the network on its own (e.g. a canal cell that's
+    // naturally underwater) — nothing to dig/pave, and it's already
+    // traversable, so placing an explicit tile here would just be a
+    // redundant dig into an existing lake/river bed.
+    if (this.isExtraNetworkCell(cell)) return false;
     // Half a tile of headroom (not a full tile) is all a centered tile's own
     // footprint needs to still fit on the terrain mesh — anything more just
     // leaves an unusable, unreachable ring around the map that spawn/target

@@ -2,9 +2,9 @@ import * as THREE from "three";
 import type RAPIER from "@dimforge/rapier3d-compat";
 import type { Rapier } from "./physics";
 import type { Terrain } from "./terrain";
-import { WATER_LEVEL } from "./terrain";
+import { WATER_LEVEL, WATER_MATERIAL_PARAMS } from "./terrain";
 import type { CanalAssets } from "./assets";
-import { TileNetwork, type Cell } from "./network";
+import { TileNetwork, TILE_SIZE, cellCenter, type Cell } from "./network";
 import { WATERFALL_BED_THRESHOLD, type WaterSim } from "./waterSim";
 
 export const CanalKind = {
@@ -30,22 +30,12 @@ export const CANAL_MIN_DEPTH = 1.4;
 export const CANAL_INITIAL_FILL = 1.0;
 const BUOY_SCALE = 0.55;
 
-const waterMaterial = new THREE.MeshStandardMaterial({
-  color: 0x2f6fa3,
-  transparent: true,
-  opacity: 0.8,
-  roughness: 0.25,
-  metalness: 0.1,
-});
-const waterQuadGeometry = new THREE.PlaneGeometry(4.05, 4.05);
-waterQuadGeometry.rotateX(-Math.PI / 2);
-
-/** A canal has no pavement of its own — its dug bed plus a locally-simulated
- * water quad (see updateWaterSurfaces) are what make it read as a waterway.
- * A pair of real Kenney channel buoys at opposite corners marks the dug
- * channel so a player can see where they've dug before/without a boat
- * sitting on it. */
-function buildCanalMarker(buoyTemplate: THREE.Object3D): { group: THREE.Object3D; waterQuad: THREE.Mesh } {
+/** A canal has no pavement of its own — its dug bed is what makes it read as
+ * a waterway (the actual water surface is one continuous mesh across every
+ * dug tile, built in updateWaterSurfaces, not per-tile). A pair of real
+ * Kenney channel buoys at opposite corners marks the dug channel so a player
+ * can see where they've dug before/without a boat sitting on it. */
+function buildCanalMarker(buoyTemplate: THREE.Object3D): THREE.Object3D {
   const group = new THREE.Group();
   for (const [x, z] of [
     [-1.4, -1.4],
@@ -59,18 +49,30 @@ function buildCanalMarker(buoyTemplate: THREE.Object3D): { group: THREE.Object3D
     });
     group.add(buoy);
   }
-
-  const waterQuad = new THREE.Mesh(waterQuadGeometry, waterMaterial);
-  waterQuad.position.y = CANAL_INITIAL_FILL; // corrected every tick by updateWaterSurfaces once the flow sim is running
-  waterQuad.receiveShadow = true;
-  group.add(waterQuad);
-
-  return { group, waterQuad };
+  return group;
 }
+
+const HALF = TILE_SIZE / 2;
+// Tile-local corner offsets in a consistent winding order (SW, SE, NE, NW).
+const CORNER_OFFSETS: Array<[number, number]> = [
+  [-HALF, -HALF],
+  [HALF, -HALF],
+  [HALF, HALF],
+  [-HALF, HALF],
+];
 
 export class CanalSystem extends TileNetwork<CanalKind> {
   private readonly canalAssets: CanalAssets;
-  private readonly waterQuads = new Map<string, THREE.Mesh>();
+  private readonly terrainRef: Terrain;
+  /** The single continuous water surface for every dug canal tile — replaces
+   * what used to be one independent, disconnected flat quad per tile (the
+   * "flying squares" bug: each tile's square popped to its own simulated
+   * height with no relation to its neighbors). Corner heights are now
+   * averaged across every tile sharing that corner, so adjacent tiles' water
+   * meshes share the exact same edge and the whole thing reads as one sloped
+   * surface — including an actual visible drop where the flow sim computes a
+   * waterfall, instead of a vertical gap between two disconnected squares. */
+  readonly waterMesh: THREE.Mesh;
 
   constructor(
     RAPIER: Rapier,
@@ -82,16 +84,21 @@ export class CanalSystem extends TileNetwork<CanalKind> {
   ) {
     super(RAPIER, world, terrain, isCellFree, claimCell);
     this.canalAssets = canalAssets;
+    this.terrainRef = terrain;
+    this.waterMesh = new THREE.Mesh(new THREE.BufferGeometry(), new THREE.MeshStandardMaterial(WATER_MATERIAL_PARAMS));
+    this.waterMesh.receiveShadow = true;
+    // this.root has no transform of its own (added directly to the scene at
+    // the origin, same as roads.root/tracks.root), so this mesh can be built
+    // straight in world-space coordinates rather than per-tile local space.
+    this.root.add(this.waterMesh);
   }
 
   protected speedMultiplier(kind: CanalKind): number {
     return CANAL_SPEED_MULTIPLIER[kind];
   }
 
-  protected buildMesh(_kind: CanalKind, _facing: number, _mask: boolean[], cell: Cell): THREE.Object3D {
-    const { group, waterQuad } = buildCanalMarker(this.canalAssets.buoy);
-    this.waterQuads.set(`${cell.col}:${cell.row}`, waterQuad);
-    return group;
+  protected buildMesh(_kind: CanalKind, _facing: number, _mask: boolean[], _cell: Cell): THREE.Object3D {
+    return buildCanalMarker(this.canalAssets.buoy);
   }
 
   /** Grades exactly like a road (climbs/descends between connected
@@ -112,6 +119,18 @@ export class CanalSystem extends TileNetwork<CanalKind> {
     return false;
   }
 
+  /** A naturally underwater cell (lake/river) is already a waterway on its
+   * own — it needs no digging and shares the same big sea-level water plane
+   * every other natural water tile uses (terrain.ts's waterMesh), so it
+   * counts as part of the canal network without ever being placed/dug.
+   * This is what lets a player just connect a dug canal to a lake's edge
+   * and treat the whole lake as traversable, instead of having to pave over
+   * it tile by tile with redundant canal digs. */
+  protected isExtraNetworkCell(cell: Cell): boolean {
+    const center = cellCenter(cell);
+    return this.terrainRef.isUnderwaterAt(center.x, center.z);
+  }
+
   /** A ship can ride a waterfall down but never climb one — blocks exactly
    * the direction that would mean going from a lower bed to a much higher
    * one, mirroring how the water sim itself treats the same drop as a
@@ -123,17 +142,64 @@ export class CanalSystem extends TileNetwork<CanalKind> {
     return bedTo - bedFrom <= WATERFALL_BED_THRESHOLD;
   }
 
-  /** Repositions each tile's water quad to the flow sim's live simulated
-   * surface height for that cell, falling back to the tile's own seed fill
-   * if the sim hasn't got a reading yet (e.g. the very first tick after
-   * placement, before Game has synced it in). */
+  /**
+   * Rebuilds the single continuous water surface from the flow sim's live
+   * heights. Corner heights are averaged across every tile sharing that
+   * corner first, so neighboring tiles' quads always meet at an identical
+   * height — no seams, no independently-popping squares — and a genuine bed
+   * drop between two tiles (a waterfall) renders as a sloped surface instead
+   * of two disconnected flat pools. Tiles are only ever added, never
+   * removed, so a full rebuild each call stays cheap (small tile counts,
+   * no allocation-heavy diffing needed).
+   */
   updateWaterSurfaces(sim: WaterSim): void {
-    for (const [key, quad] of this.waterQuads) {
-      const tile = this.tiles.get(key);
-      if (!tile) continue;
-      const [col, row] = key.split(":").map(Number);
-      const waterHeight = sim.getWaterHeight({ col, row });
-      quad.position.y = (waterHeight ?? tile.centerHeight + CANAL_INITIAL_FILL) - tile.centerHeight;
+    if (this.tiles.size === 0) {
+      if (this.waterMesh.geometry.attributes.position) this.waterMesh.geometry = new THREE.BufferGeometry();
+      return;
     }
+
+    const cornerSum = new Map<string, { height: number; count: number }>();
+    const waterHeightOf = (cell: Cell, centerHeight: number): number =>
+      sim.getWaterHeight(cell) ?? centerHeight + CANAL_INITIAL_FILL;
+
+    for (const tile of this.tiles.values()) {
+      const center = cellCenter(tile.cell);
+      const waterHeight = waterHeightOf(tile.cell, tile.centerHeight);
+      for (const [dx, dz] of CORNER_OFFSETS) {
+        const key = `${center.x + dx}:${center.z + dz}`;
+        const entry = cornerSum.get(key);
+        if (entry) {
+          entry.height += waterHeight;
+          entry.count += 1;
+        } else {
+          cornerSum.set(key, { height: waterHeight, count: 1 });
+        }
+      }
+    }
+
+    const positions: number[] = [];
+    for (const tile of this.tiles.values()) {
+      const center = cellCenter(tile.cell);
+      const corners = CORNER_OFFSETS.map(([dx, dz]) => {
+        const key = `${center.x + dx}:${center.z + dz}`;
+        const entry = cornerSum.get(key)!;
+        return { x: center.x + dx, y: entry.height / entry.count, z: center.z + dz };
+      });
+      const [sw, se, ne, nw] = corners;
+      // Two triangles winding so their normal faces +Y (see the CCW-from-
+      // above derivation this order was chosen for).
+      pushTriangle(positions, sw, ne, se);
+      pushTriangle(positions, sw, nw, ne);
+    }
+
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+    geometry.computeVertexNormals();
+    this.waterMesh.geometry.dispose();
+    this.waterMesh.geometry = geometry;
   }
+}
+
+function pushTriangle(positions: number[], a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }, c: { x: number; y: number; z: number }): void {
+  positions.push(a.x, a.y, a.z, b.x, b.y, b.z, c.x, c.y, c.z);
 }
