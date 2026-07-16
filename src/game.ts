@@ -174,6 +174,7 @@ export class Game {
 
     this.hud = new Hud(this.container, {
       onSelectBuild: (id) => {
+        if (this.selectedBuildKind === SHIP_TOOL_PUMP && id !== SHIP_TOOL_PUMP) this.pumps.cancelPending();
         this.selectedBuildKind = id;
         this.hud.setSelectedBuild(id);
       },
@@ -430,7 +431,9 @@ export class Game {
       if (!ok) {
         this.hud.showMessage(
           usePump
-            ? "Can't place a pump there — it needs an already-wet neighbor to draw from, and the cell itself must be free and dry."
+            ? this.pumps.awaitingOutlet
+              ? "Can't place the outlet there — needs a free, dry tile."
+              : "Can't place a pump there — it needs an already-wet neighbor to draw from, and the cell itself must be free and dry."
             : "Can't dig there — it's already at max depth, claimed by another transport, or already open water.",
         );
         return;
@@ -441,8 +444,17 @@ export class Game {
         return;
       }
       this.economy.spend(cost);
-      if (usePump) this.pumps.place(cell);
-      else this.canals.dig(cell);
+      if (usePump) {
+        const wasAwaitingOutlet = this.pumps.awaitingOutlet;
+        this.pumps.place(cell);
+        this.hud.showMessage(
+          wasAwaitingOutlet
+            ? "Pump connected — water is now flowing to the outlet."
+            : "Pump placed — tap another tile to send its water there.",
+        );
+      } else {
+        this.canals.dig(cell);
+      }
       this.hud.update(this.economy, this.costMultiplier());
       this.refreshPath();
       return;
@@ -659,6 +671,7 @@ export class Game {
     this.autopilot.clearPath();
     this.train.clearPath();
     this.ship.clearPath();
+    this.pumps.cancelPending();
     this.updateCountdownStatus();
   }
 
