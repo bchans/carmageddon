@@ -14,8 +14,6 @@ export const TOLL_REWARD = 50;
 
 export const ROAD_COST: Record<RoadKind, number> = {
   [RoadKind.Standard]: 6,
-  [RoadKind.Mud]: 2,
-  [RoadKind.Boost]: 14,
   [RoadKind.Crossroad]: 18,
   [RoadKind.Ramp]: 12,
 };
@@ -25,15 +23,15 @@ export const TRACK_COST: Record<TrackKind, number> = {
 };
 
 // Digging a canal bed is pricier than laying pavement/rail on ground that's
-// already there, but tracks/canals — unlike roads — have no cheap "Mud"-style
-// fallback kind, so this can't run as far ahead of the road/track cost as it
-// used to without risking an unrecoverable first round. Charged per
-// application, so re-digging the same tile to deepen it costs the same
-// again each time.
+// already there. Charged per application, so re-digging the same tile to
+// deepen it costs the same again each time.
 export const CANAL_DIG_COST = 7;
 // A pump is a bigger investment than a single dig — it's what makes an
 // artificial lake possible at all rather than just a deeper hole.
 export const PUMP_COST = 16;
+// A highway sign is a modifier on an already-placed road tile, not a tile of
+// its own — priced the same as the old "Boost strip" road kind it replaces.
+export const HIGHWAY_SIGN_COST = 14;
 
 // How much every build cost scales up as the map fills up (see Game's
 // occupiedFraction) — the core "harder because space is taken up" knob.

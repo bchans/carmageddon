@@ -3,7 +3,7 @@ import type RAPIER from "@dimforge/rapier3d-compat";
 import { initPhysics, type Rapier } from "./physics";
 import { Terrain } from "./terrain";
 import { Car } from "./car";
-import { RoadSystem, RoadKind, SPEED_MULTIPLIER } from "./roads";
+import { RoadSystem, RoadKind, HIGHWAY_SIGN_SPEED_MULTIPLIER } from "./roads";
 import { TrackSystem, TrackKind } from "./tracks";
 import { CanalSystem } from "./canals";
 import { PumpSystem } from "./pumps";
@@ -11,7 +11,7 @@ import { TILE_SIZE, DIRS, cellKey, worldToCell, type Cell, type Waypoint } from 
 import { Train } from "./train";
 import { Ship } from "./ship";
 import { WaterField } from "./waterField";
-import { Economy, ROAD_COST, TRACK_COST, CANAL_DIG_COST, PUMP_COST, TOLL_REWARD, SPACE_COST_SCALE } from "./economy";
+import { Economy, ROAD_COST, TRACK_COST, CANAL_DIG_COST, PUMP_COST, HIGHWAY_SIGN_COST, TOLL_REWARD, SPACE_COST_SCALE } from "./economy";
 import { CameraController, MIN_ZOOM, MAX_ZOOM } from "./input";
 import { Autopilot } from "./autopilot";
 import { Hud, type BuildOption } from "./hud";
@@ -37,17 +37,18 @@ const TRANSPORT_LABEL: Record<TransportKind, string> = { car: "🚗 Car", train:
 
 const ROAD_LABELS: Record<RoadKind, string> = {
   [RoadKind.Standard]: "Road",
-  [RoadKind.Mud]: "Mud (cheap, slow)",
-  [RoadKind.Boost]: "Boost strip",
   [RoadKind.Crossroad]: "Crossroad",
   [RoadKind.Ramp]: "Ramp",
 };
 const TRACK_LABELS: Record<TrackKind, string> = { [TrackKind.Standard]: "Track" };
 // Ship mode has two tools, not a set of tile "kinds" — a repeatable dig
 // (see CanalSystem) and a directional pump (see PumpSystem) — selected the
-// same way a road/track kind is, via the build panel.
+// same way a road/track kind is, via the build panel. Car mode similarly has
+// one non-RoadKind tool: a highway sign, a modifier on an already-placed
+// road tile rather than a tile kind of its own (see RoadSystem.placeSign).
 const SHIP_TOOL_DIG = "dig";
 const SHIP_TOOL_PUMP = "pump";
+const CAR_TOOL_SIGN = "sign";
 
 export class Game {
   private scene = new THREE.Scene();
@@ -362,7 +363,8 @@ export class Game {
 
   private buildOptionsFor(kind: TransportKind): BuildOption[] {
     if (kind === "car") {
-      return Object.values(RoadKind).map((k) => ({ id: k, label: ROAD_LABELS[k], baseCost: ROAD_COST[k] }));
+      const roadOptions = Object.values(RoadKind).map((k) => ({ id: k, label: ROAD_LABELS[k], baseCost: ROAD_COST[k] }));
+      return [...roadOptions, { id: CAR_TOOL_SIGN, label: "Highway sign", baseCost: HIGHWAY_SIGN_COST }];
     }
     if (kind === "train") {
       return Object.values(TrackKind).map((k) => ({ id: k, label: TRACK_LABELS[k], baseCost: TRACK_COST[k] }));
@@ -421,9 +423,30 @@ export class Game {
     return this.selectedBuildKind === SHIP_TOOL_PUMP;
   }
 
+  /** Whether the currently-selected car tool is the highway sign (vs. a RoadKind). */
+  private get carToolIsSign(): boolean {
+    return this.selectedBuildKind === CAR_TOOL_SIGN;
+  }
+
   private onTap(clientX: number, clientY: number): void {
     const cell = this.raycastCell(clientX, clientY);
     if (!cell) return;
+
+    if (this.activeTransport === "car" && this.carToolIsSign) {
+      if (!this.roads.canPlaceSign(cell)) {
+        this.hud.showMessage("Can't place a sign there — needs an existing road tile (not a ramp) without one already.");
+        return;
+      }
+      const cost = Math.round(HIGHWAY_SIGN_COST * this.costMultiplier());
+      if (!this.economy.canAfford(cost)) {
+        this.hud.showMessage("Not enough toll money for that.");
+        return;
+      }
+      this.economy.spend(cost);
+      this.roads.placeSign(cell);
+      this.hud.update(this.economy, this.costMultiplier());
+      return;
+    }
 
     if (this.activeTransport === "ship") {
       const usePump = this.shipToolIsPump;
@@ -482,6 +505,15 @@ export class Game {
     const cell = this.raycastCell(clientX, clientY);
     if (!cell) {
       this.hoverMarker.visible = false;
+      return;
+    }
+
+    if (this.activeTransport === "car" && this.carToolIsSign) {
+      const center = this.roads.cellWorldCenter(cell);
+      this.hoverMarker.position.set(center.x, center.y + 0.1, center.z);
+      this.hoverMarker.visible = true;
+      const ok = this.roads.canPlaceSign(cell);
+      (this.hoverMarker.material as THREE.MeshBasicMaterial).color.set(ok ? 0x4ade80 : 0xef4444);
       return;
     }
 
@@ -579,7 +611,7 @@ export class Game {
       const p = this.car.position;
       const onRoad = this.roads.getKindAt(p.x, p.z);
       if (onRoad) {
-        this.car.speedZoneMultiplier = SPEED_MULTIPLIER[onRoad];
+        this.car.speedZoneMultiplier = this.roads.hasSignAt(p.x, p.z) ? HIGHWAY_SIGN_SPEED_MULTIPLIER : 1;
       } else if (this.terrain.isUnderwaterAt(p.x, p.z)) {
         this.car.speedZoneMultiplier = 0.12;
       } else {

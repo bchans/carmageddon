@@ -417,6 +417,11 @@ export abstract class TileNetwork<TKind extends string> {
     // traversable, so placing an explicit tile here would just be a
     // redundant dig into an existing lake/river bed.
     if (this.isExtraNetworkCell(cell)) return false;
+    // Never pave a road/track tile directly over water — same rule canals
+    // and pumps already apply to their own placement (see CanalSystem.canDig,
+    // PumpSystem.canPlace), just never extended to the shared network base.
+    const center = cellCenter(cell);
+    if (this.terrain.isUnderwaterAt(center.x, center.z)) return false;
     // Half a tile of headroom (not a full tile) is all a centered tile's own
     // footprint needs to still fit on the terrain mesh — anything more just
     // leaves an unusable, unreachable ring around the map that spawn/target

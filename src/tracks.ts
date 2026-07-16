@@ -26,14 +26,19 @@ export const TRACK_SPEED_MULTIPLIER: Record<TrackKind, number> = {
 const IDENTITY_TINT_TARGET = 0xffffff;
 const IDENTITY_SWATCH: number[] = [1, 1, 1];
 
-// The corner-large template natively (rotationY = 0) connects dirs {3, 0}
-// (W, N) — same pivot as the road kit's corner piece. (An earlier {0, 1}
-// assumption here was wrong: sampling the raw GLB's own bounding box before
-// recentering showed its geometry actually extends toward -X/+Z, i.e. hugs
-// the west/north edges exactly like the road corner, not north/east — that
-// mismatch rotated every placed curve tile by a fixed wrong offset, which is
-// why curves visually faced the wrong way.)
-const TRACK_CORNER_NATIVE_DIRS: [number, number] = [3, 0];
+// The corner-large template natively (rotationY = 0) connects dirs {0, 1}
+// (N, E) — measured directly, not guessed: after the exact same recenter
+// buildKenneyMesh/assets.ts apply, every rail vertex in the loaded mesh was
+// sampled in world space at each of the 4 rotation steps and matched against
+// the true tile-edge-midpoint distance for N/E/S/W. At rotationY=0 the
+// closest two edges by a wide margin (~0.38 vs ~1.24 units) are N and E; the
+// other three rotation steps each shift that pair by exactly one DIRS step,
+// confirming both this constant and curveRotationSteps' formula are
+// self-consistent. (A previous fix here changed this to {3, 0} by reasoning
+// from the raw GLB's pre-recenter bounding-box *corners*, which don't
+// actually mark where the rail's two tangent legs terminate for a wide
+// sweeping arc — that was the regression the {0, 1} value below corrects.)
+const TRACK_CORNER_NATIVE_DIRS: [number, number] = [0, 1];
 
 function buildStraightTrack(axisIsZ: boolean, pitch: number, trackAssets: TrackAssets): THREE.Object3D {
   return buildKenneyMesh(trackAssets.straight, axisIsZ ? 0 : Math.PI / 2, IDENTITY_TINT_TARGET, IDENTITY_SWATCH, pitch, 1);
@@ -137,7 +142,11 @@ export class TrackSystem extends TileNetwork<TrackKind> {
     return buildStraightTrack(true, pitch, this.trackAssets); // isolated tile: default N/S stub
   }
 
-  protected curbColor(): number {
-    return 0x35302a; // dark ballast-shoulder tint, distinct from a road's grey curb
+  protected buildsCurbs(): boolean {
+    // Trains run on rails, not free-roaming physics — there's no gameplay
+    // reason for a car-style solid retaining wall around a track tile's
+    // unconnected edges (most visible/ugly at dead-ends, where 3 of the 4
+    // sides would get walled in).
+    return false;
   }
 }

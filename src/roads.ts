@@ -7,6 +7,7 @@ import {
   TileNetwork,
   TILE_SIZE,
   DIRS,
+  cellKey,
   type Cell,
   buildKenneyMesh,
   buildKenneyShapeMesh,
@@ -26,18 +27,13 @@ export const RoadKind = {
   Standard: "standard",
   Crossroad: "crossroad",
   Ramp: "ramp",
-  Boost: "boost",
-  Mud: "mud",
 } as const;
 export type RoadKind = (typeof RoadKind)[keyof typeof RoadKind];
 
-export const SPEED_MULTIPLIER: Record<RoadKind, number> = {
-  [RoadKind.Standard]: 1,
-  [RoadKind.Crossroad]: 1,
-  [RoadKind.Ramp]: 1,
-  [RoadKind.Boost]: 1.7,
-  [RoadKind.Mud]: 0.45,
-};
+// A highway sign is a modifier placed on an already-built road tile (see
+// RoadSystem.placeSign), not a RoadKind of its own, so this is the only
+// speed multiplier left in the road system.
+export const HIGHWAY_SIGN_SPEED_MULTIPLIER = 1.6;
 
 // --- Road surfaces ---------------------------------------------------------
 //
@@ -62,9 +58,51 @@ const TILE_TARGET_COLOR: Record<RoadKind, number> = {
   [RoadKind.Standard]: 0xacaeb4,
   [RoadKind.Crossroad]: 0xacaeb4,
   [RoadKind.Ramp]: 0xacaeb4,
-  [RoadKind.Boost]: 0xffa53d,
-  [RoadKind.Mud]: 0x6b5636,
 };
+
+// --- Highway sign -----------------------------------------------------------
+//
+// A modifier placed on an already-built road tile rather than a tile kind of
+// its own — the player picks a spot on their existing road, not a fresh cell.
+// No Kenney sign asset exists in this repo (kenney.nl itself is unreachable
+// from this sandbox — see the note on the train kit above), so this is a
+// small procedural placeholder (post + green placard) rather than a real
+// Kenney model; swap it for one if a suitable GLB gets added later.
+const SIGN_POST_HEIGHT = 1.6;
+const signPostMaterial = new THREE.MeshStandardMaterial({ color: 0x3a3a3a, roughness: 0.6, metalness: 0.4 });
+const signBoardMaterial = new THREE.MeshStandardMaterial({ color: 0x1f7a3d, roughness: 0.5, metalness: 0.1 });
+const signChevronMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.5 });
+
+function buildHighwaySignMesh(facing: number): THREE.Object3D {
+  const group = new THREE.Group();
+
+  const post = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, SIGN_POST_HEIGHT, 8), signPostMaterial);
+  post.position.y = SIGN_POST_HEIGHT / 2;
+  post.castShadow = true;
+  group.add(post);
+
+  const board = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.9, 1.1), signBoardMaterial);
+  board.position.y = SIGN_POST_HEIGHT - 0.5;
+  board.castShadow = true;
+  group.add(board);
+
+  // A simple upward chevron on the placard reads as "speed up ahead" without
+  // needing any text/texture.
+  for (const dz of [-0.22, 0, 0.22]) {
+    const chevron = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.22, 0.32), signChevronMaterial);
+    chevron.position.set(0.035, SIGN_POST_HEIGHT - 0.5, dz);
+    chevron.rotation.x = dz === 0 ? 0 : (dz > 0 ? -1 : 1) * 0.5;
+    group.add(chevron);
+  }
+
+  // Planted at the tile's edge facing oncoming traffic, not the center, like
+  // a real roadside sign — offset towards the incoming direction and turned
+  // to face it.
+  const { dc, dr } = DIRS[facing];
+  group.position.set(dc * (TILE_SIZE / 2 - 0.3), 0, dr * (TILE_SIZE / 2 - 0.3));
+  group.rotation.y = Math.atan2(dc, dr) + Math.PI / 2;
+  return group;
+}
 
 // The road-slant-high.glb template's own slope rises along its local +X axis at
 // rotationY=0 (verified empirically: sampling its vertices found a height
@@ -79,6 +117,7 @@ function buildRampMesh(facing: number, roadAssets: RoadAssets): THREE.Object3D {
 
 export class RoadSystem extends TileNetwork<RoadKind> {
   private readonly roadAssets: RoadAssets;
+  private readonly signedCells = new Set<string>();
 
   constructor(
     RAPIER: Rapier,
@@ -92,8 +131,35 @@ export class RoadSystem extends TileNetwork<RoadKind> {
     this.roadAssets = roadAssets;
   }
 
-  protected speedMultiplier(kind: RoadKind): number {
-    return SPEED_MULTIPLIER[kind];
+  protected speedMultiplier(): number {
+    return 1; // all remaining road kinds are equal-speed for pathfinding purposes
+  }
+
+  /** Whether a highway sign can be planted at `cell` — needs an already-built
+   * road tile (any kind but Ramp, which has its own launch mechanic) that
+   * doesn't already have one. */
+  canPlaceSign(cell: Cell): boolean {
+    const tile = this.tiles.get(cellKey(cell));
+    if (!tile || tile.kind === RoadKind.Ramp) return false;
+    return !this.signedCells.has(cellKey(cell));
+  }
+
+  placeSign(cell: Cell): boolean {
+    if (!this.canPlaceSign(cell)) return false;
+    const tile = this.tiles.get(cellKey(cell))!;
+    this.signedCells.add(cellKey(cell));
+    const mesh = buildHighwaySignMesh(tile.facing);
+    mesh.position.add(this.cellWorldCenter(cell));
+    this.root.add(mesh);
+    return true;
+  }
+
+  /** Whether the road tile at this world position has a highway sign — see placeSign(). */
+  hasSignAt(x: number, z: number): boolean {
+    const cell = this.worldToCell(x, z);
+    if (Math.abs(x - cell.col * TILE_SIZE) > TILE_SIZE / 2) return false;
+    if (Math.abs(z - cell.row * TILE_SIZE) > TILE_SIZE / 2) return false;
+    return this.signedCells.has(cellKey(cell));
   }
 
   protected canSlope(kind: RoadKind): boolean {
