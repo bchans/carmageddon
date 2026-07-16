@@ -123,7 +123,7 @@ export class Game {
     for (const template of Object.values(assets.ship)) applyMaxAnisotropy(template, maxAnisotropy);
 
     this.setupLights();
-    this.terrain = Terrain.generate(this.RAPIER, this.world, 1);
+    this.terrain = Terrain.generate(this.RAPIER, this.world, Math.floor(this.rng() * 0xffffffff));
     this.waterField = new WaterField(this.terrain);
     this.scene.add(this.terrain.mesh, this.waterField.mesh);
 

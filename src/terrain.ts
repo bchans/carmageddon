@@ -58,34 +58,57 @@ export class Terrain {
     const noise2D = createNoise2D(rng);
     const heights = new Float32Array(GRID * GRID);
 
-    // Base heightmap: fractal Brownian motion (layered noise).
+    // Pick a map archetype so consecutive games don't all look the same
+    // shape of terrain, just with different noise: a river-cut valley (one
+    // to three carved rivers), a basin dotted with one or two proper lakes,
+    // or sparser, taller highlands with just a trickle of water. Every
+    // archetype still guarantees at least one water body so ship rounds
+    // always have somewhere to float.
+    const archetypeRoll = rng();
+    const archetype: "river" | "lake" | "highlands" =
+      archetypeRoll < 0.4 ? "river" : archetypeRoll < 0.75 ? "lake" : "highlands";
+
+    // Base heightmap: fractal Brownian motion (layered noise). Highlands get
+    // a taller amplitude and a higher bias so the map reads as rugged and
+    // mostly dry rather than just "the usual hills with less water".
+    const amplitude = archetype === "highlands" ? 13 : 9;
+    const heightBias = archetype === "highlands" ? 4 : 3;
     const baseFreq = 1 / 45; // rescaled with TERRAIN_SIZE so the map keeps similar relative ruggedness
     const octaves = 5;
     for (let iy = 0; iy < GRID; iy++) {
       for (let ix = 0; ix < GRID; ix++) {
         const x = -TERRAIN_SIZE / 2 + ix * SPACING;
         const z = -TERRAIN_SIZE / 2 + iy * SPACING;
-        let amplitude = 1;
+        let amp = 1;
         let frequency = baseFreq;
         let sum = 0;
         let maxAmp = 0;
         for (let o = 0; o < octaves; o++) {
-          sum += noise2D(x * frequency, z * frequency) * amplitude;
-          maxAmp += amplitude;
-          amplitude *= 0.5;
+          sum += noise2D(x * frequency, z * frequency) * amp;
+          maxAmp += amp;
+          amp *= 0.5;
           frequency *= 2;
         }
         const n = sum / maxAmp; // roughly [-1, 1]
         // Push extremes apart a bit so we get flatter plains and clearer hills.
         const shaped = Math.sign(n) * Math.pow(Math.abs(n), 1.3);
-        heights[idx(iy, ix)] = shaped * 9 + 3; // ~[-6, 12]-ish, biased above water
+        heights[idx(iy, ix)] = shaped * amplitude + heightBias;
       }
     }
 
     const isRiver = new Uint8Array(GRID * GRID);
-    const riverCount = 2;
-    for (let r = 0; r < riverCount; r++) {
-      carveRiver(heights, isRiver, rng);
+    if (archetype === "river") {
+      const riverCount = 1 + Math.floor(rng() * 3); // 1-3
+      for (let r = 0; r < riverCount; r++) carveRiver(heights, isRiver, rng);
+    } else if (archetype === "lake") {
+      const lakeCount = 1 + Math.floor(rng() * 2); // 1-2
+      for (let l = 0; l < lakeCount; l++) carveLake(heights, rng);
+    } else {
+      // Highlands: sparse water — a single thin river about half the time,
+      // a single small lake otherwise — enough for a ship round to still
+      // work without the map reading as anything but dry and rugged.
+      if (rng() < 0.5) carveRiver(heights, isRiver, rng);
+      else carveLake(heights, rng);
     }
 
     smooth(heights, 1);
@@ -306,6 +329,32 @@ function carveRiver(heights: Float32Array, isRiver: Uint8Array, rng: () => numbe
         heights[i] = THREE.MathUtils.lerp(heights[i], target, falloff * falloff * falloff);
         if (dist < riverWidth * 0.6) isRiver[i] = 1;
       }
+    }
+  }
+}
+
+/** Carves a round basin well below sea level — a proper standalone lake
+ * rather than the incidental ponds that can form wherever the base noise
+ * happens to dip low. A gentler (squared, not cubed) falloff than
+ * carveRiver's so the shoreline reads as a natural bowl instead of a sharp
+ * channel bank. */
+function carveLake(heights: Float32Array, rng: () => number): void {
+  const margin = 8;
+  const cix = margin + Math.floor(rng() * (GRID - margin * 2));
+  const ciy = margin + Math.floor(rng() * (GRID - margin * 2));
+  const radius = 4 + rng() * 4;
+  const target = WATER_LEVEL - 0.6;
+  const ceilRadius = Math.ceil(radius);
+  for (let dy = -ceilRadius; dy <= ceilRadius; dy++) {
+    for (let dx = -ceilRadius; dx <= ceilRadius; dx++) {
+      const ax = cix + dx;
+      const ay = ciy + dy;
+      if (ax < 0 || ax >= GRID || ay < 0 || ay >= GRID) continue;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist > radius) continue;
+      const falloff = 1 - dist / radius;
+      const i = idx(ay, ax);
+      heights[i] = THREE.MathUtils.lerp(heights[i], target, falloff * falloff);
     }
   }
 }
