@@ -15,6 +15,7 @@ function round(n: number, decimals = 3): number {
   return Math.round(n * f) / f;
 }
 
+/** Road/track tiles (still real TileNetwork subclasses with shape/slope grading). */
 function tileSummary(net: unknown, cell: Cell): unknown {
   const n = net as { ["tiles"]?: Map<string, { kind: string; centerHeight: number; facing: number; slope: unknown }> };
   const tile = n["tiles"]?.get(cellKey(cell));
@@ -26,6 +27,21 @@ function tileSummary(net: unknown, cell: Cell): unknown {
     facing: tile.facing,
     slope: slope ? { axisIsZ: slope.axisIsZ, loHeight: round(slope.loHeight), hiHeight: round(slope.hiHeight) } : null,
   };
+}
+
+/** A canal is just a repeatable dig now — no tile shape, just how many times it's been dug. */
+function canalSummary(canals: unknown, cell: Cell): unknown {
+  const n = canals as { digLevelAt?: (cell: Cell) => number };
+  if (typeof n.digLevelAt !== "function") return null;
+  const level = n.digLevelAt(cell);
+  return level > 0 ? { digLevel: level } : null;
+}
+
+/** A pump, if one sits at this cell — its facing direction (index into DIRS, N/E/S/W). */
+function pumpSummary(pumps: unknown, cell: Cell): unknown {
+  const n = pumps as { ["pumps"]?: Map<string, { dir: number }> };
+  const pump = n["pumps"]?.get(cellKey(cell));
+  return pump ? { facing: DIR_NAMES[pump.dir] } : null;
 }
 
 function edgeHeight(net: unknown, cell: Cell, dir: number): number | null {
@@ -50,14 +66,15 @@ export function inspectCell(game: Game, cell: Cell): Record<string, unknown> {
   const waterField = g.waterField as { depthAt: (x: number, z: number) => number; isNavigable: (x: number, z: number) => boolean; surfaceHeightAt: (x: number, z: number) => number };
   const center = cellCenter(cell);
 
-  const networks: Array<[string, unknown]> = [
+  const tileNetworks: Array<[string, unknown]> = [
     ["road", g.roads],
     ["track", g.tracks],
-    ["canal", g.canals],
   ];
 
   const networkInfo: Record<string, unknown> = {};
-  for (const [name, net] of networks) networkInfo[name] = tileSummary(net, cell);
+  for (const [name, net] of tileNetworks) networkInfo[name] = tileSummary(net, cell);
+  networkInfo.canal = canalSummary(g.canals, cell);
+  networkInfo.pump = pumpSummary(g.pumps, cell);
 
   const neighbors: Record<string, unknown> = {};
   DIRS.forEach(({ dc, dr }, dir) => {
@@ -68,12 +85,14 @@ export function inspectCell(game: Game, cell: Cell): Record<string, unknown> {
       terrainHeight: round(terrain.getHeightAt(nCenter.x, nCenter.z)),
       waterDepth: round(waterField.depthAt(nCenter.x, nCenter.z)),
     };
-    for (const [name, net] of networks) {
+    for (const [name, net] of tileNetworks) {
       const nTile = tileSummary(net, nCell) as { centerHeight: number } | null;
       entry[`${name}Bed`] = nTile ? nTile.centerHeight : null;
       entry[`${name}EdgeFromHere`] = edgeHeight(net, cell, dir);
       entry[`${name}EdgeFromThere`] = edgeHeight(net, nCell, (dir + 2) % 4);
     }
+    entry.canal = canalSummary(g.canals, nCell);
+    entry.pump = pumpSummary(g.pumps, nCell);
     neighbors[DIR_NAMES[dir]] = entry;
   });
 

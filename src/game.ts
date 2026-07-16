@@ -5,12 +5,13 @@ import { Terrain } from "./terrain";
 import { Car } from "./car";
 import { RoadSystem, RoadKind, SPEED_MULTIPLIER } from "./roads";
 import { TrackSystem, TrackKind } from "./tracks";
-import { CanalSystem, CanalKind } from "./canals";
+import { CanalSystem } from "./canals";
+import { PumpSystem } from "./pumps";
 import { TILE_SIZE, DIRS, cellKey, worldToCell, type Cell, type Waypoint } from "./network";
 import { Train } from "./train";
 import { Ship } from "./ship";
 import { WaterField } from "./waterField";
-import { Economy, ROAD_COST, TRACK_COST, CANAL_COST, TOLL_REWARD, SPACE_COST_SCALE } from "./economy";
+import { Economy, ROAD_COST, TRACK_COST, CANAL_DIG_COST, PUMP_COST, TOLL_REWARD, SPACE_COST_SCALE } from "./economy";
 import { CameraController, MIN_ZOOM, MAX_ZOOM } from "./input";
 import { Autopilot } from "./autopilot";
 import { Hud, type BuildOption } from "./hud";
@@ -40,7 +41,11 @@ const ROAD_LABELS: Record<RoadKind, string> = {
   [RoadKind.Ramp]: "Ramp",
 };
 const TRACK_LABELS: Record<TrackKind, string> = { [TrackKind.Standard]: "Track" };
-const CANAL_LABELS: Record<CanalKind, string> = { [CanalKind.Standard]: "Canal" };
+// Ship mode has two tools, not a set of tile "kinds" — a repeatable dig
+// (see CanalSystem) and a directional pump (see PumpSystem) — selected the
+// same way a road/track kind is, via the build panel.
+const SHIP_TOOL_DIG = "dig";
+const SHIP_TOOL_PUMP = "pump";
 
 export class Game {
   private scene = new THREE.Scene();
@@ -58,6 +63,7 @@ export class Game {
   private roads!: RoadSystem;
   private tracks!: TrackSystem;
   private canals!: CanalSystem;
+  private pumps!: PumpSystem;
   private waterField!: WaterField;
   private economy = new Economy();
   private cameraController!: CameraController;
@@ -113,7 +119,6 @@ export class Game {
     for (const template of Object.values(assets.track)) applyMaxAnisotropy(template, maxAnisotropy);
     for (const template of Object.values(assets.train)) applyMaxAnisotropy(template, maxAnisotropy);
     for (const template of Object.values(assets.ship)) applyMaxAnisotropy(template, maxAnisotropy);
-    for (const template of Object.values(assets.canal)) applyMaxAnisotropy(template, maxAnisotropy);
 
     this.setupLights();
     this.terrain = Terrain.generate(this.RAPIER, this.world, 1);
@@ -128,15 +133,16 @@ export class Game {
 
     this.roads = new RoadSystem(this.RAPIER, this.world, this.terrain, assets.road, isCellFree("car"), claimCell("car"));
     this.tracks = new TrackSystem(this.RAPIER, this.world, this.terrain, assets.track, isCellFree("train"), claimCell("train"));
-    this.canals = new CanalSystem(this.RAPIER, this.world, this.terrain, assets.canal, this.waterField, isCellFree("ship"), claimCell("ship"));
-    this.scene.add(this.roads.root, this.tracks.root, this.canals.root);
+    this.canals = new CanalSystem(this.terrain, this.waterField, isCellFree("ship"), claimCell("ship"));
+    this.pumps = new PumpSystem(this.terrain, this.waterField, isCellFree("ship"), claimCell("ship"));
+    this.scene.add(this.roads.root, this.tracks.root, this.pumps.root);
 
     this.carSpawnEdge = Math.floor(this.rng() * 4);
     this.carSpawn = this.pickEdgePoint(this.carSpawnEdge);
     this.trainSpawnEdge = Math.floor(this.rng() * 4);
     this.trainSpawn = this.pickEdgePoint(this.trainSpawnEdge);
     this.shipSpawnEdge = Math.floor(this.rng() * 4);
-    this.shipSpawn = this.pickEdgePoint(this.shipSpawnEdge);
+    this.shipSpawn = this.pickWaterEdgePoint(this.shipSpawnEdge);
 
     const carSpawnLift = this.carSpawn.clone();
     carSpawnLift.y += 1;
@@ -258,6 +264,61 @@ export class Game {
     return this.pickEdgePoint(edge);
   }
 
+  /**
+   * A ship's spawn/target must always be *in* water — it's a boat, not a
+   * dock crew — so unlike pickEdgePoint this requires WaterField.isNavigable
+   * rather than avoiding it. Tries the preferred edge first (same random
+   * sampling as pickEdgePoint); if that specific edge happens to have no
+   * water touching it at all, falls back to scanning the whole boundary
+   * ring for any navigable point, then — in the vanishingly unlikely case
+   * the map has no boundary water anywhere — any navigable point at all.
+   */
+  private pickWaterEdgePoint(edge: number): THREE.Vector3 {
+    const half = this.terrain.worldSize / 2 - SPAWN_MARGIN;
+    const isNS = edge === 0 || edge === 2;
+    const fixed = this.snapToGrid((edge === 0 || edge === 1 ? 1 : -1) * half);
+    for (let attempt = 0; attempt < 60; attempt++) {
+      const roam = this.snapToGrid((this.rng() * 2 - 1) * half);
+      const x = isNS ? roam : fixed;
+      const z = isNS ? fixed : roam;
+      if (!this.waterField.isNavigable(x, z)) continue;
+      return new THREE.Vector3(x, this.waterField.surfaceHeightAt(x, z), z);
+    }
+
+    const maxCell = Math.floor((this.terrain.worldSize / 2 - TILE_SIZE / 2) / TILE_SIZE);
+    const ringCandidates: THREE.Vector3[] = [];
+    for (let col = -maxCell; col <= maxCell; col++) {
+      for (const row of [-maxCell, maxCell]) this.collectIfNavigable(col, row, ringCandidates);
+    }
+    for (let row = -maxCell + 1; row <= maxCell - 1; row++) {
+      for (const col of [-maxCell, maxCell]) this.collectIfNavigable(col, row, ringCandidates);
+    }
+    if (ringCandidates.length > 0) return ringCandidates[Math.floor(this.rng() * ringCandidates.length)];
+
+    for (let col = -maxCell; col <= maxCell; col++) {
+      for (let row = -maxCell; row <= maxCell; row++) {
+        const x = col * TILE_SIZE;
+        const z = row * TILE_SIZE;
+        if (this.waterField.isNavigable(x, z)) return new THREE.Vector3(x, this.waterField.surfaceHeightAt(x, z), z);
+      }
+    }
+    // Shouldn't happen — terrain generation always carves rivers reaching
+    // the map edge — but never crash the game over it.
+    return this.pickEdgePoint(edge);
+  }
+
+  private collectIfNavigable(col: number, row: number, out: THREE.Vector3[]): void {
+    const x = col * TILE_SIZE;
+    const z = row * TILE_SIZE;
+    if (this.waterField.isNavigable(x, z)) out.push(new THREE.Vector3(x, this.waterField.surfaceHeightAt(x, z), z));
+  }
+
+  private pickWaterTargetPoint(spawnEdge: number): THREE.Vector3 {
+    const otherEdges = [0, 1, 2, 3].filter((e) => e !== spawnEdge);
+    const edge = otherEdges[Math.floor(this.rng() * otherEdges.length)];
+    return this.pickWaterEdgePoint(edge);
+  }
+
   /** The horizontal direction a vehicle should face when it spawns on `edge`, so it starts out driving into the map instead of towards the boundary/off the map. */
   private edgeInwardDir(edge: number): THREE.Vector3 {
     // Edge 0=N (+Z side) faces -Z inward, 1=E (+X side) faces -X, 2=S (-Z side)
@@ -288,7 +349,7 @@ export class Game {
   /** Fraction of the buildable grid already claimed by any transport — the "harder because space is taken up" difficulty knob. */
   private occupiedFraction(): number {
     const totalCells = Math.pow(this.terrain.worldSize / TILE_SIZE - 2, 2);
-    const used = this.roads.tileCount + this.tracks.tileCount + this.canals.tileCount;
+    const used = this.roads.tileCount + this.tracks.tileCount + this.canals.tileCount + this.pumps.tileCount;
     return Math.min(1, used / totalCells);
   }
 
@@ -303,7 +364,10 @@ export class Game {
     if (kind === "train") {
       return Object.values(TrackKind).map((k) => ({ id: k, label: TRACK_LABELS[k], baseCost: TRACK_COST[k] }));
     }
-    return Object.values(CanalKind).map((k) => ({ id: k, label: CANAL_LABELS[k], baseCost: CANAL_COST[k] }));
+    return [
+      { id: SHIP_TOOL_DIG, label: "Dig", baseCost: CANAL_DIG_COST },
+      { id: SHIP_TOOL_PUMP, label: "Pump", baseCost: PUMP_COST },
+    ];
   }
 
   /** Recomputes the active network's route and hands it to whichever vehicle is running this round. */
@@ -349,21 +413,45 @@ export class Game {
     }
   }
 
+  /** Whether the currently-selected ship tool is the pump (vs. the default dig). */
+  private get shipToolIsPump(): boolean {
+    return this.selectedBuildKind === SHIP_TOOL_PUMP;
+  }
+
   private onTap(clientX: number, clientY: number): void {
     const cell = this.raycastCell(clientX, clientY);
     if (!cell) return;
 
-    const network = this.activeTransport === "car" ? this.roads : this.activeTransport === "train" ? this.tracks : this.canals;
+    if (this.activeTransport === "ship") {
+      const usePump = this.shipToolIsPump;
+      const ok = usePump ? this.pumps.canPlace(cell) : this.canals.canDig(cell);
+      if (!ok) {
+        this.hud.showMessage(
+          usePump
+            ? "Can't place a pump there — it needs an already-wet neighbor to draw from, and the cell itself must be free and dry."
+            : "Can't dig there — it's already at max depth, claimed by another transport, or already open water.",
+        );
+        return;
+      }
+      const cost = Math.round((usePump ? PUMP_COST : CANAL_DIG_COST) * this.costMultiplier());
+      if (!this.economy.canAfford(cost)) {
+        this.hud.showMessage("Not enough toll money for that.");
+        return;
+      }
+      this.economy.spend(cost);
+      if (usePump) this.pumps.place(cell);
+      else this.canals.dig(cell);
+      this.hud.update(this.economy, this.costMultiplier());
+      this.refreshPath();
+      return;
+    }
+
+    const network = this.activeTransport === "car" ? this.roads : this.tracks;
     if (!network.canPlace(cell)) {
       this.hud.showMessage("Can't place there — must connect to your network, and stay off other transports' tiles.");
       return;
     }
-    const baseCost =
-      this.activeTransport === "car"
-        ? ROAD_COST[this.selectedBuildKind as RoadKind]
-        : this.activeTransport === "train"
-          ? TRACK_COST[this.selectedBuildKind as TrackKind]
-          : CANAL_COST[this.selectedBuildKind as CanalKind];
+    const baseCost = this.activeTransport === "car" ? ROAD_COST[this.selectedBuildKind as RoadKind] : TRACK_COST[this.selectedBuildKind as TrackKind];
     const cost = Math.round(baseCost * this.costMultiplier());
     if (!this.economy.canAfford(cost)) {
       this.hud.showMessage("Not enough toll money for that.");
@@ -371,8 +459,7 @@ export class Game {
     }
     this.economy.spend(cost);
     if (this.activeTransport === "car") this.roads.place(cell, this.selectedBuildKind as RoadKind);
-    else if (this.activeTransport === "train") this.tracks.place(cell, this.selectedBuildKind as TrackKind);
-    else this.canals.place(cell, this.selectedBuildKind as CanalKind);
+    else this.tracks.place(cell, this.selectedBuildKind as TrackKind);
     this.hud.update(this.economy, this.costMultiplier());
     this.refreshPath();
   }
@@ -383,7 +470,18 @@ export class Game {
       this.hoverMarker.visible = false;
       return;
     }
-    const network = this.activeTransport === "car" ? this.roads : this.activeTransport === "train" ? this.tracks : this.canals;
+
+    if (this.activeTransport === "ship") {
+      const usePump = this.shipToolIsPump;
+      const center = usePump ? this.pumps.cellWorldCenter(cell) : this.canals.cellWorldCenter(cell);
+      this.hoverMarker.position.set(center.x, center.y + 0.1, center.z);
+      this.hoverMarker.visible = true;
+      const ok = usePump ? this.pumps.canPlace(cell) : this.canals.canDig(cell);
+      (this.hoverMarker.material as THREE.MeshBasicMaterial).color.set(ok ? 0x4ade80 : 0xef4444);
+      return;
+    }
+
+    const network = this.activeTransport === "car" ? this.roads : this.tracks;
     const center = network.cellWorldCenter(cell);
     this.hoverMarker.position.set(center.x, center.y + 0.1, center.z);
     this.hoverMarker.visible = true;
@@ -433,6 +531,7 @@ export class Game {
       roadTiles: this.roads.tileCount,
       trackTiles: this.tracks.tileCount,
       canalTiles: this.canals.tileCount,
+      pumpTiles: this.pumps.tileCount,
       render: { ...this.renderer.info.render },
       memory: { ...this.renderer.info.memory },
     });
@@ -540,7 +639,7 @@ export class Game {
       this.trainTarget = this.pickTargetPoint(this.trainSpawnEdge);
       this.tracks.setEndpoints(this.trainSpawn, this.trainTarget);
     } else {
-      this.shipTarget = this.pickTargetPoint(this.shipSpawnEdge);
+      this.shipTarget = this.pickWaterTargetPoint(this.shipSpawnEdge);
       this.canals.setEndpoints(this.shipSpawn, this.shipTarget);
     }
 

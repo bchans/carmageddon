@@ -1,146 +1,122 @@
-import * as THREE from "three";
-import type RAPIER from "@dimforge/rapier3d-compat";
-import type { Rapier } from "./physics";
 import type { Terrain } from "./terrain";
-import { WATER_LEVEL } from "./terrain";
-import type { CanalAssets } from "./assets";
 import type { WaterField } from "./waterField";
-import { TileNetwork, cellCenter, directionBetween, type Cell } from "./network";
+import { TILE_SIZE, cellCenter, cellKey, worldToCell, type Cell, type Waypoint } from "./network";
+import * as THREE from "three";
 
-export const CanalKind = {
-  Standard: "standard",
-} as const;
-export type CanalKind = (typeof CanalKind)[keyof typeof CanalKind];
+// How much a single dig application lowers a cell's bed, relative to that
+// cell's own original (pre-dig) terrain height — not an absolute floor, so
+// digging works the same way regardless of the local terrain's elevation.
+// Repeatable (see dig() below): one application is usually enough near sea
+// level, several deepen a pit dug into higher ground or meant to hold a
+// deeper artificial lake.
+export const CANAL_DIG_STEP = 0.8;
+// Caps how many times the same cell can be dug, so a player can't spam it
+// into an absurd bottomless pit.
+export const CANAL_MAX_DIG_LEVEL = 6;
 
-export const CANAL_SPEED_MULTIPLIER: Record<CanalKind, number> = {
-  [CanalKind.Standard]: 1,
-};
-
-// A canal bed is never allowed shallower than this below WATER_LEVEL — a
-// floor, not a fixed depth: grading otherwise works exactly like a road (see
-// canSlope/targetFlatHeight below), climbing/descending between connected
-// neighbors, but an isolated or dry-land-adjacent tile still needs *some*
-// forced minimum dig or it would just flatten to whatever bone-dry ground is
-// already there instead of becoming a waterway at all.
-export const CANAL_MIN_DEPTH = 1.4;
-// A ship can ride a waterfall down but never climb one — this caps how much
-// a single tile-to-tile bed climb is still considered "a connected pool"
-// for pathfinding, vs. a one-way drop. Purely a ship-navigation rule; the
-// actual water surface (WaterField) needs no equivalent special case at
-// all — it's just diffusion, and a climb like this naturally reads as a
-// cascade there already.
-const WATERFALL_BED_THRESHOLD = 0.3;
-const BUOY_SCALE = 0.55;
-const BUOY_REST_HEIGHT = 1.0;
-
-/** A canal has no pavement of its own — its dug bed is what makes it read as
- * a waterway (the water surface itself belongs entirely to WaterField, the
- * one shared height-field simulation covering the whole map — a canal tile
- * is just a grid region whose bed got dug below sea level, nothing more). A
- * pair of real Kenney channel buoys at opposite corners marks the dug
- * channel so a player can see where they've dug before/without a boat
- * sitting on it. */
-function buildCanalMarker(buoyTemplate: THREE.Object3D): THREE.Object3D {
-  const group = new THREE.Group();
-  for (const [x, z] of [
-    [-1.4, -1.4],
-    [1.4, 1.4],
-  ]) {
-    const buoy = buoyTemplate.clone(true);
-    buoy.scale.setScalar(BUOY_SCALE);
-    buoy.position.set(x, BUOY_REST_HEIGHT, z);
-    buoy.traverse((obj) => {
-      if (obj instanceof THREE.Mesh) obj.castShadow = true;
-    });
-    group.add(buoy);
-  }
-  return group;
-}
-
-export class CanalSystem extends TileNetwork<CanalKind> {
-  private readonly canalAssets: CanalAssets;
+/**
+ * A canal is nothing but a repeatable dig tool now — placing one just
+ * carves a trench into the terrain (targetHeight below); there is no
+ * "canal tile" shape, network, or visual marker of its own. Whether the
+ * trench ever holds water, and whether a ship can sail through it, is
+ * entirely up to WaterField (flow) and its own findPath (routing through
+ * whatever's currently wet) — this class only ever touches the ground.
+ */
+export class CanalSystem {
+  private readonly terrain: Terrain;
   private readonly waterField: WaterField;
+  private readonly isCellFree: (cell: Cell) => boolean;
+  private readonly claimCell: (cell: Cell) => void;
+  private readonly dug = new Map<string, { cell: Cell; level: number; origin: number }>();
+  private spawnCell: Cell = { col: 0, row: 0 };
+  private targetCell: Cell = { col: 0, row: 0 };
 
   constructor(
-    RAPIER: Rapier,
-    world: RAPIER.World,
     terrain: Terrain,
-    canalAssets: CanalAssets,
     waterField: WaterField,
     isCellFree: (cell: Cell) => boolean,
     claimCell: (cell: Cell) => void,
   ) {
-    super(RAPIER, world, terrain, isCellFree, claimCell);
-    this.canalAssets = canalAssets;
+    this.terrain = terrain;
     this.waterField = waterField;
+    this.isCellFree = isCellFree;
+    this.claimCell = claimCell;
   }
 
-  protected speedMultiplier(kind: CanalKind): number {
-    return CANAL_SPEED_MULTIPLIER[kind];
+  setEndpoints(spawnWorld: THREE.Vector3, targetWorld: THREE.Vector3): void {
+    this.spawnCell = worldToCell(spawnWorld.x, spawnWorld.z);
+    this.targetCell = worldToCell(targetWorld.x, targetWorld.z);
   }
 
-  protected buildMesh(_kind: CanalKind, _facing: number, _mask: boolean[], _cell: Cell): THREE.Object3D {
-    return buildCanalMarker(this.canalAssets.buoy);
-  }
-
-  /** Grades exactly like a road (climbs/descends between connected
-   * neighbors via the shared slope logic) — the only canal-specific rule is
-   * the minimum-dig floor below, not a uniform flat depth everywhere. */
-  protected canSlope(): boolean {
+  canDig(cell: Cell): boolean {
+    if (Math.abs(cell.col * TILE_SIZE) > this.terrain.worldSize / 2 - TILE_SIZE / 2) return false;
+    if (Math.abs(cell.row * TILE_SIZE) > this.terrain.worldSize / 2 - TILE_SIZE / 2) return false;
+    if (!this.isCellFree(cell)) return false;
+    const existing = this.dug.get(cellKey(cell));
+    if (existing && existing.level >= CANAL_MAX_DIG_LEVEL) return false;
+    if (!existing) {
+      const center = cellCenter(cell);
+      // Never dig directly into a already-natural lake/river/ocean cell —
+      // it's already a waterway on its own; see WaterField's isNavigable.
+      if (this.terrain.isUnderwaterAt(center.x, center.z)) return false;
+    }
     return true;
   }
 
-  protected targetFlatHeight(cell: Cell, mask: boolean[]): number {
-    const natural = super.targetFlatHeight(cell, mask);
-    return Math.min(natural, WATER_LEVEL - CANAL_MIN_DEPTH);
-  }
-
-  // No curb walls — a canal's "walls" are just its banks (the untouched
-  // terrain around it), not a physical barrier tile.
-  protected buildsCurbs(): boolean {
-    return false;
-  }
-
-  /** A cell WaterField already considers navigable (a lake, a river, open
-   * ocean) is already a waterway on its own — it needs no digging, and
-   * counts as part of the canal network without ever being placed. This is
-   * what lets a player just connect a dug canal to a lake's edge and treat
-   * the whole lake as traversable, instead of having to pave over it tile
-   * by tile with redundant, doubly-rendered canal digs. */
-  protected isExtraNetworkCell(cell: Cell): boolean {
+  /** Digs (or re-digs, deepening it further) the bed at `cell`. Returns false if canDig() would've refused. */
+  dig(cell: Cell): boolean {
+    if (!this.canDig(cell)) return false;
+    const key = cellKey(cell);
     const center = cellCenter(cell);
-    return this.waterField.isNavigable(center.x, center.z);
+    let entry = this.dug.get(key);
+    if (!entry) {
+      entry = { cell, level: 0, origin: this.terrain.getHeightAt(center.x, center.z) };
+      this.dug.set(key, entry);
+      this.claimCell(cell);
+    }
+    entry.level += 1;
+    const targetHeight = entry.origin - entry.level * CANAL_DIG_STEP;
+    this.terrain.flattenForRoad(center.x, center.z, TILE_SIZE / 2, () => targetHeight);
+    return true;
   }
 
-  /**
-   * A ship can only sail into a cell that's actually wet — placing a canal
-   * tile just carves a trench (see targetFlatHeight/canSlope above); the
-   * water arriving there is purely a consequence of WaterField's own flow
-   * simulation, which takes a moment to actually flow in once a dig
-   * connects to a real water source. Routing through a dry trench would
-   * mean the ship visibly sails on bare ground. Exempts the ship's actual
-   * spawn/target (always a dry-land edge point — a dock, not a water
-   * cell) so the route can still start and end there. Also still blocks a
-   * ship riding a waterfall down but never climbing one — the direction
-   * that would mean going from a lower bed to a much higher one, checked
-   * at the actual seam between the two tiles (edgeHeightTowards) rather
-   * than their overall centers, which can disagree by a lot even at a
-   * perfectly smooth seam once one side is sloped (see edgeHeightTowards
-   * for why — its own doc explains the false positive this used to hit).
-   */
-  protected canTraverseEdge(from: Cell, to: Cell): boolean {
-    const dir = directionBetween(from, to);
-    if (dir !== null) {
-      const edgeFrom = this.edgeHeightTowards(from, dir);
-      const edgeTo = this.edgeHeightTowards(to, (dir + 2) % 4);
-      if (edgeFrom !== null && edgeTo !== null && edgeTo - edgeFrom > WATERFALL_BED_THRESHOLD) return false;
+  digLevelAt(cell: Cell): number {
+    return this.dug.get(cellKey(cell))?.level ?? 0;
+  }
+
+  get tileCount(): number {
+    return this.dug.size;
+  }
+
+  get occupiedCells(): Cell[] {
+    return [...this.dug.values()].map((d) => d.cell);
+  }
+
+  /** Dry-ground world center of `cell`, for the hover marker — matches every other network's convention (a not-yet-dug tile still highlights sensibly). */
+  cellWorldCenter(cell: Cell): THREE.Vector3 {
+    const c = cellCenter(cell);
+    c.y = this.terrain.getHeightAt(c.x, c.z);
+    return c;
+  }
+
+  /** Routes purely through currently-navigable water — see WaterField.findPath. */
+  findPath(): Cell[] | null {
+    return this.waterField.findPath(this.spawnCell, this.targetCell);
+  }
+
+  buildWaypoints(path: Cell[], spawnWorld: THREE.Vector3, targetWorld: THREE.Vector3): Waypoint[] {
+    const points: Waypoint[] = [];
+    for (let i = 0; i < path.length; i++) {
+      if (i === 0) {
+        points.push({ position: spawnWorld.clone(), slow: false });
+        continue;
+      }
+      if (i === path.length - 1) {
+        points.push({ position: targetWorld.clone(), slow: false });
+        continue;
+      }
+      points.push({ position: cellCenter(path[i]), slow: false });
     }
-
-    const isEndpoint = (to.col === this.spawnCell.col && to.row === this.spawnCell.row) ||
-      (to.col === this.targetCell.col && to.row === this.targetCell.row);
-    if (isEndpoint) return true;
-
-    const center = cellCenter(to);
-    return this.waterField.isNavigable(center.x, center.z);
+    return points;
   }
 }

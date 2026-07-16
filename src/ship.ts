@@ -25,10 +25,11 @@ function buildBoatMesh(assets: ShipAssets): THREE.Object3D {
 }
 
 /**
- * A kinematic (non-Rapier) transport, floating at a fixed water-surface
- * height (game.ts stamps every waypoint's y to WATER_LEVEL before handing
- * them to setPath, since a canal's own graded height is its carved bed, not
- * its water surface). Adds a small idle bob/roll for a bit of life at rest.
+ * A kinematic (non-Rapier) transport, floating at the live water surface
+ * height (game.ts stamps every waypoint's y to WaterField.surfaceHeightAt
+ * before handing them to setPath, since a dug canal's own graded height is
+ * its carved bed, not its water surface). Adds a small idle bob/roll for a
+ * bit of life at rest.
  */
 export class Ship {
   readonly mesh: THREE.Object3D;

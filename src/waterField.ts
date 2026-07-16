@@ -1,6 +1,7 @@
 import * as THREE from "three";
 import type { Terrain } from "./terrain";
 import { TERRAIN_SIZE, TERRAIN_SEGMENTS, WATER_LEVEL } from "./terrain";
+import { DIRS, cellCenter, cellKey, type Cell } from "./network";
 
 const GRID = TERRAIN_SEGMENTS + 1;
 const SPACING = TERRAIN_SIZE / TERRAIN_SEGMENTS;
@@ -30,6 +31,15 @@ const FLOW_RATE = 3.0;
 const MIN_DEPTH = 0.015;
 // Minimum depth for a ship to actually be considered afloat there.
 export const NAVIGABLE_DEPTH = 0.08;
+// How much depth a pump moves from its source cell into its destination
+// cell per second, ignoring the normal "only flows downhill" rule — the
+// one deliberate exception in the whole simulation, representing an active
+// mechanical lift rather than gravity-driven flow.
+const PUMP_RATE = 1.5;
+// A pump's destination never pools deeper than this, regardless of how
+// long it's been running — without a cap, an isolated pumped-into pit with
+// nowhere for the water to go on its own would just grow forever.
+const PUMP_MAX_DEPTH = 3.0;
 
 const WATER_MATERIAL_PARAMS = {
   color: 0x2f6fa3,
@@ -87,6 +97,9 @@ export class WaterField {
   private scratch: Float32Array;
   private readonly positions: Float32Array;
   private readonly normals: Float32Array;
+  /** Active pumps as resolved grid-vertex index pairs (resolved once at
+   * registration, since a pump's cell never moves) — see registerPump(). */
+  private readonly pumps: Array<{ fromIdx: number; toIdx: number }> = [];
   readonly mesh: THREE.Mesh;
 
   constructor(terrain: Terrain) {
@@ -174,7 +187,86 @@ export class WaterField {
 
     for (let i = 0; i < next.length; i++) depth[i] = Math.max(0, next[i]);
 
+    // Pass 3: pumps. A direction-agnostic, explicit exception to "water
+    // only flows downhill" — each registered pump pulls depth straight
+    // from its fixed source vertex into its fixed destination vertex,
+    // capped by what the source actually holds and by PUMP_MAX_DEPTH at
+    // the destination so it can't tower indefinitely.
+    for (const pump of this.pumps) {
+      const available = depth[pump.fromIdx];
+      const room = Math.max(0, PUMP_MAX_DEPTH - depth[pump.toIdx]);
+      const amount = Math.min(available, room, PUMP_RATE * dt);
+      if (amount <= 0) continue;
+      depth[pump.fromIdx] -= amount;
+      depth[pump.toIdx] += amount;
+    }
+
     this.rebuildMesh();
+  }
+
+  /** Registers a pump that continuously moves water from `from` into `to`
+   * every step, regardless of relative bed height — see PUMP_RATE/Pass 3
+   * above. Resolves both cells to grid vertices once, since a placed
+   * pump's cells never move. */
+  registerPump(from: Cell, to: Cell): void {
+    const fromCenter = cellCenter(from);
+    const toCenter = cellCenter(to);
+    this.pumps.push({
+      fromIdx: this.nearestVertex(fromCenter.x, fromCenter.z),
+      toIdx: this.nearestVertex(toCenter.x, toCenter.z),
+    });
+  }
+
+  /**
+   * Shortest path (BFS, uniform cost) from `spawn` to `target` through
+   * currently-navigable water only — two cells are connected if both are
+   * wet (see isNavigable) and orthogonally adjacent. This is the entire
+   * routing rule for ships: there's no separate "canal network" to
+   * consult, a route exists exactly when a connected chain of actual water
+   * exists, whether that water is a natural lake or a player-dug and
+   * since-filled trench. Returns null if no such chain currently connects
+   * the two points (e.g. a fresh dig that hasn't filled in yet).
+   */
+  findPath(spawn: Cell, target: Cell): Cell[] | null {
+    const startKey = cellKey(spawn);
+    const goalKey = cellKey(target);
+    if (startKey === goalKey) return [spawn];
+
+    const visited = new Set<string>([startKey]);
+    const prev = new Map<string, Cell>();
+    const queue: Cell[] = [spawn];
+    for (let qi = 0; qi < queue.length; qi++) {
+      const current = queue[qi];
+      if (cellKey(current) === goalKey) break;
+      for (const { dc, dr } of DIRS) {
+        const next: Cell = { col: current.col + dc, row: current.row + dr };
+        const key = cellKey(next);
+        if (visited.has(key)) continue;
+        const c = cellCenter(next);
+        if (!this.isNavigable(c.x, c.z)) continue;
+        visited.add(key);
+        prev.set(key, current);
+        queue.push(next);
+      }
+    }
+    if (!visited.has(goalKey)) return null;
+
+    const path: Cell[] = [target];
+    let curKey = goalKey;
+    while (curKey !== startKey) {
+      const p = prev.get(curKey);
+      if (!p) return null;
+      path.push(p);
+      curKey = cellKey(p);
+    }
+    path.reverse();
+    return path;
+  }
+
+  private nearestVertex(x: number, z: number): number {
+    const ix = THREE.MathUtils.clamp(Math.round((x + TERRAIN_SIZE / 2) / SPACING), 0, GRID - 1);
+    const iy = THREE.MathUtils.clamp(Math.round((z + TERRAIN_SIZE / 2) / SPACING), 0, GRID - 1);
+    return idx(iy, ix);
   }
 
   /** Bilinear-interpolated water depth at a world-space (x, z) coordinate. */
@@ -201,11 +293,11 @@ export class WaterField {
    * (the same clamp-to-edge behavior Terrain.getHeightAt uses, intentional
    * there for sampling near a boundary spawn/target point), so without this
    * check every point off the edge of the map would silently inherit
-   * whatever that edge vertex's wetness happens to be. CanalSystem's
-   * isExtraNetworkCell relies on this to decide network membership during
-   * pathfinding — if it ever came back true unbounded, a coastal map edge
-   * would make Dijkstra "discover" infinitely many phantom navigable cells
-   * marching outward forever with nothing to stop it.
+   * whatever that edge vertex's wetness happens to be. findPath() relies on
+   * this to decide connectivity — if it ever came back true unbounded, a
+   * coastal map edge would make the search "discover" infinitely many
+   * phantom navigable cells marching outward forever with nothing to stop
+   * it.
    */
   isNavigable(x: number, z: number): boolean {
     if (Math.abs(x) > TERRAIN_SIZE / 2 || Math.abs(z) > TERRAIN_SIZE / 2) return false;

@@ -1,7 +1,6 @@
 import { BASE_CAR_STATS, type CarStats } from "./car";
 import { RoadKind } from "./roads";
 import { TrackKind } from "./tracks";
-import { CanalKind } from "./canals";
 
 // Every round now connects two full map edges (see Game.pickTargetPoint),
 // which measured out to a ~13-tile median and ~23-tile worst-case straight-
@@ -28,10 +27,13 @@ export const TRACK_COST: Record<TrackKind, number> = {
 // Digging a canal bed is pricier than laying pavement/rail on ground that's
 // already there, but tracks/canals — unlike roads — have no cheap "Mud"-style
 // fallback kind, so this can't run as far ahead of the road/track cost as it
-// used to without risking an unrecoverable first round.
-export const CANAL_COST: Record<CanalKind, number> = {
-  [CanalKind.Standard]: 7,
-};
+// used to without risking an unrecoverable first round. Charged per
+// application, so re-digging the same tile to deepen it costs the same
+// again each time.
+export const CANAL_DIG_COST = 7;
+// A pump is a bigger investment than a single dig — it's what makes an
+// artificial lake possible at all rather than just a deeper hole.
+export const PUMP_COST = 16;
 
 // How much every build cost scales up as the map fills up (see Game's
 // occupiedFraction) — the core "harder because space is taken up" knob.
