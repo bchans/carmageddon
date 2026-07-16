@@ -30,7 +30,6 @@ export class Terrain {
   readonly heights: Float32Array;
   readonly isRiver: Uint8Array;
   readonly mesh: THREE.Mesh;
-  readonly waterMesh: THREE.Mesh;
   readonly rigidBody: RAPIER.RigidBody;
   private collider: RAPIER.Collider;
   private readonly RAPIER: Rapier;
@@ -42,7 +41,6 @@ export class Terrain {
     heights: Float32Array,
     isRiver: Uint8Array,
     mesh: THREE.Mesh,
-    waterMesh: THREE.Mesh,
     rigidBody: RAPIER.RigidBody,
     collider: RAPIER.Collider,
   ) {
@@ -51,7 +49,6 @@ export class Terrain {
     this.heights = heights;
     this.isRiver = isRiver;
     this.mesh = mesh;
-    this.waterMesh = waterMesh;
     this.rigidBody = rigidBody;
     this.collider = collider;
   }
@@ -94,7 +91,6 @@ export class Terrain {
     smooth(heights, 1);
 
     const mesh = buildMesh(heights, isRiver);
-    const waterMesh = buildWater();
 
     const rigidBody = world.createRigidBody(RAPIER.RigidBodyDesc.fixed());
     // Rapier's heightfield buffer is indexed transposed relative to the row-major
@@ -114,7 +110,7 @@ export class Terrain {
     ).setFriction(1.0);
     const collider = world.createCollider(colliderDesc, rigidBody);
 
-    return new Terrain(RAPIER, world, heights, isRiver, mesh, waterMesh, rigidBody, collider);
+    return new Terrain(RAPIER, world, heights, isRiver, mesh, rigidBody, collider);
   }
 
   /** Bilinear-interpolated terrain height at a world-space (x, z) coordinate. */
@@ -399,24 +395,3 @@ function buildMesh(heights: Float32Array, isRiver: Uint8Array): THREE.Mesh {
   mesh.castShadow = false;
   return mesh;
 }
-
-function buildWater(): THREE.Mesh {
-  const geometry = new THREE.PlaneGeometry(TERRAIN_SIZE * 1.02, TERRAIN_SIZE * 1.02);
-  geometry.rotateX(-Math.PI / 2);
-  const mesh = new THREE.Mesh(geometry, WATER_MATERIAL.clone());
-  mesh.position.y = WATER_LEVEL;
-  return mesh;
-}
-
-// Shared look for every water surface in the game — the natural sea-level
-// plane above and a dug canal's own surface (canals.ts) both clone this, so
-// there's one consistent material instead of two independently-tuned blues
-// that read as separate water systems.
-export const WATER_MATERIAL_PARAMS = {
-  color: 0x2f6fa3,
-  transparent: true,
-  opacity: 0.78,
-  roughness: 0.28,
-  metalness: 0.1,
-} as const;
-const WATER_MATERIAL = new THREE.MeshStandardMaterial(WATER_MATERIAL_PARAMS);
