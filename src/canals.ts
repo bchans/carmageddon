@@ -5,7 +5,7 @@ import type { Terrain } from "./terrain";
 import { WATER_LEVEL } from "./terrain";
 import type { CanalAssets } from "./assets";
 import type { WaterField } from "./waterField";
-import { TileNetwork, cellCenter, type Cell } from "./network";
+import { TileNetwork, cellCenter, directionBetween, type Cell } from "./network";
 
 export const CanalKind = {
   Standard: "standard",
@@ -122,12 +122,19 @@ export class CanalSystem extends TileNetwork<CanalKind> {
    * spawn/target (always a dry-land edge point — a dock, not a water
    * cell) so the route can still start and end there. Also still blocks a
    * ship riding a waterfall down but never climbing one — the direction
-   * that would mean going from a lower bed to a much higher one.
+   * that would mean going from a lower bed to a much higher one, checked
+   * at the actual seam between the two tiles (edgeHeightTowards) rather
+   * than their overall centers, which can disagree by a lot even at a
+   * perfectly smooth seam once one side is sloped (see edgeHeightTowards
+   * for why — its own doc explains the false positive this used to hit).
    */
   protected canTraverseEdge(from: Cell, to: Cell): boolean {
-    const bedFrom = this.tileHeight(from);
-    const bedTo = this.tileHeight(to);
-    if (bedFrom !== null && bedTo !== null && bedTo - bedFrom > WATERFALL_BED_THRESHOLD) return false;
+    const dir = directionBetween(from, to);
+    if (dir !== null) {
+      const edgeFrom = this.edgeHeightTowards(from, dir);
+      const edgeTo = this.edgeHeightTowards(to, (dir + 2) % 4);
+      if (edgeFrom !== null && edgeTo !== null && edgeTo - edgeFrom > WATERFALL_BED_THRESHOLD) return false;
+    }
 
     const isEndpoint = (to.col === this.spawnCell.col && to.row === this.spawnCell.row) ||
       (to.col === this.targetCell.col && to.row === this.targetCell.row);

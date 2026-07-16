@@ -764,4 +764,32 @@ export abstract class TileNetwork<TKind extends string> {
     const tile = this.tiles.get(cellKey(cell));
     return tile ? tile.centerHeight : null;
   }
+
+  /**
+   * Height of a placed tile's edge facing `dir`, or null if nothing's
+   * built at `cell`. For a flat tile this is just centerHeight (the bed
+   * is uniform everywhere), but for a *sloped* tile centerHeight is only
+   * the midpoint of its own internal ramp — grading (see gradeCell)
+   * always sets a sloped tile's own low/high edges to match its
+   * neighbors' heights exactly, so two adjacent tiles are physically
+   * continuous at the seam between them even when their centers differ
+   * quite a bit (one may be flat, the other sloped, or both sloped at
+   * different points along their own ramps). Comparing *edges* facing
+   * each other is what actually reflects whether there's a real
+   * discontinuity between two specific neighbors — comparing centers
+   * conflates that with "how much does this tile's own internal ramp
+   * climb," which can trip a false positive even at a seam that's
+   * perfectly smooth.
+   */
+  edgeHeightTowards(cell: Cell, dir: number): number | null {
+    const tile = this.tiles.get(cellKey(cell));
+    if (!tile) return null;
+    if (!tile.slope) return tile.centerHeight;
+    const { axisIsZ, loHeight, hiHeight } = tile.slope;
+    const loDir = axisIsZ ? 2 : 3;
+    const hiDir = axisIsZ ? 0 : 1;
+    if (dir === hiDir) return hiHeight;
+    if (dir === loDir) return loHeight;
+    return tile.centerHeight; // perpendicular to the slope's own axis; approximate with center
+  }
 }
