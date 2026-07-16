@@ -48,7 +48,7 @@ const PUMP_MAX_DEPTH = 3.0;
 const SHALLOW_REF_DEPTH = 0.45;
 const SHALLOW_COLOR = new THREE.Color(0x6fb2c9);
 const DEEP_COLOR = new THREE.Color(0x1f5a86);
-const MIN_ALPHA = 0.12;
+const MIN_ALPHA = 0.05;
 const MAX_ALPHA = 0.82;
 // How fast the smoothed per-vertex flow display decays back towards zero
 // once the underlying diffusion stops moving water through a vertex — a
@@ -115,9 +115,19 @@ function createWaterMaterial(): THREE.MeshStandardMaterial {
           "{",
           "  float depthT = clamp(vWaterDepth / shallowRefDepth, 0.0, 1.0);",
           "  diffuseColor.rgb = mix(shallowColor, deepColor, depthT);",
+          // A steeper curve than the color blend for alpha specifically, so
+          // a razor-thin film right at the shoreline reads as barely-there
+          // rather than a flat, uniformly-visible wash over a wide gentle
+          // slope (which is what made the whole bank look painted blue).
+          "  float alphaT = pow(depthT, 1.6);",
           "  float grazing = 1.0 - clamp(dot(normalize(vNormal), normalize(vViewPosition)), 0.0, 1.0);",
           "  float fresnel = pow(grazing, 3.0);",
-          "  diffuseColor.a = clamp(mix(minAlpha, maxAlpha, depthT) + fresnel * 0.25, 0.0, 1.0);",
+          // Fresnel brightening is scaled by depth too — otherwise a raking
+          // view across a shallow shoreline slope gets the full grazing-angle
+          // boost regardless of how thin the film is there, which visually
+          // re-creates the "whole slope painted blue" look this shading was
+          // built to fix in the first place.
+          "  diffuseColor.a = clamp(mix(minAlpha, maxAlpha, alphaT) + fresnel * alphaT * 0.25, 0.0, 1.0);",
           // Streaks stretched along the local flow direction and scrolled
           // over time at a speed tied to flow strength, so moving water
           // visibly streams while still water stays glassy (flowMag ~ 0
