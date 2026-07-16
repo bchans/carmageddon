@@ -211,8 +211,21 @@ export class WaterField {
     return this.terrain.getHeightAt(x, z) + this.depthAt(x, z);
   }
 
-  /** Whether there's enough water at (x, z) for a ship to actually float. */
+  /**
+   * Whether there's enough water at (x, z) for a ship to actually float.
+   * Explicitly false outside the map's real extent — depthAt()'s bilinear
+   * sample clamps to the nearest edge vertex for any point beyond the grid
+   * (the same clamp-to-edge behavior Terrain.getHeightAt uses, intentional
+   * there for sampling near a boundary spawn/target point), so without this
+   * check every point off the edge of the map would silently inherit
+   * whatever that edge vertex's wetness happens to be. CanalSystem's
+   * isExtraNetworkCell relies on this to decide network membership during
+   * pathfinding — if it ever came back true unbounded, a coastal map edge
+   * would make Dijkstra "discover" infinitely many phantom navigable cells
+   * marching outward forever with nothing to stop it.
+   */
   isNavigable(x: number, z: number): boolean {
+    if (Math.abs(x) > TERRAIN_SIZE / 2 || Math.abs(z) > TERRAIN_SIZE / 2) return false;
     return this.depthAt(x, z) >= NAVIGABLE_DEPTH;
   }
 
