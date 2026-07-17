@@ -10,21 +10,46 @@ function idx(iy: number, ix: number): number {
   return iy * GRID + ix;
 }
 
+/** Index of the x-edge connecting (iy,ix)-(iy,ix+1), for ix in [0, GRID-2]. */
+function edgeIdxX(iy: number, ix: number): number {
+  return iy * (GRID - 1) + ix;
+}
+
+/** Index of the z-edge connecting (iy,ix)-(iy+1,ix), for iy in [0, GRID-2]. */
+function edgeIdxZ(iy: number, ix: number): number {
+  return iy * GRID + ix;
+}
+
 // How fast a submerged cell's depth relaxes toward "full to sea level" per
 // second — gentle rather than instant, so a freshly-dug canal visibly
 // floods in over roughly half a second instead of popping full, while
 // still converging fast enough that a stable pool reads as "full" almost
-// immediately.
+// immediately. It also acts as a radiating boundary condition for the wave
+// sim below: a lake/ocean cell keeps getting pulled back toward its flat
+// rest level regardless of what the momentum step just did there, so wave
+// energy arriving from a canal dissipates into "the sea" instead of
+// reflecting forever.
 const SEA_RELAX_RATE = 2.2;
-// Fraction of the surface-height (bed + depth) difference between two
-// neighboring cells exchanged per second — this alone is what produces a
-// visible waterfall: a cell whose bed pokes up above WATER_LEVEL gets no
-// relax-to-full term (see step()), so it only ever holds however much
-// water flows in from a lower/wetter neighbor. A climbing stretch of canal
-// thins out and follows the bed contour instead of pooling — a real
-// cascade — while a flat or sunken stretch settles into a calm connected
-// pool.
-const FLOW_RATE = 3.0;
+// How strongly gravity accelerates water across an edge per unit of
+// surface-height difference. Matches the world's own (arcade-scaled)
+// gravity — see game.ts's Rapier world, created with `{ x: 0, y: -16, z: 0
+// }` — so wave speed feels proportionate to how everything else in this
+// world falls, rather than using real-world 9.8 and looking sluggish next
+// to the car/ship physics.
+const WAVE_GRAVITY = 16;
+// Edge-velocity friction (1/s). Water has real inertia now — a disturbance
+// (a pump kicking on, a canal connecting to a lake) overshoots and sloshes
+// for a couple of cycles instead of snapping straight to equilibrium — but
+// without damping it would ring forever. This settles it within a few
+// seconds.
+const WAVE_DAMPING = 1.6;
+// Safety multiplier over the local shallow-water wave speed sqrt(g·depth)
+// used to cap edge velocity. Physically motivated (a shallow-water wave
+// can't meaningfully outrun its own wave speed) rather than an arbitrary
+// number, and only ever engages if something unusual — a big pump slug
+// dumping into a nearly-dry cell, a cliff-edge canal into deep water —
+// would otherwise push the explicit integrator unstable.
+const MAX_SPEED_FACTOR = 3;
 // Below this: dry — not rendered, not navigable. Above zero so a barely-wet
 // vertex right at the shoreline doesn't flicker in and out from float
 // noise.
@@ -161,17 +186,24 @@ function createWaterMaterial(): THREE.MeshStandardMaterial {
  *     originalHeights below) gently relaxes towards being filled up to
  *     global sea level. This is the only self-sourcing rule in the whole
  *     simulation — the one legitimate "infinite reservoir" in the game.
- *  2. Neighbor-to-neighbor diffusion, driven purely by the surface-height
- *     difference between adjacent cells and capped by what the upstream
- *     side actually holds, connects everything together. This is the
- *     *only* way any other cell — including a freshly-dug canal, no
- *     matter how deep — ever gets water: it has to flow in from an
- *     already-wet neighbor, exactly like a real dug channel only fills
- *     once it's actually connected to a water source. A climbing stretch
- *     thins out and follows the bed contour (a real cascade) instead of
- *     pooling, and an isolated, not-yet-connected dig just stays dry —
- *     placing a canal tile carves a trench, nothing more; the water
- *     arriving there is purely a consequence of rule 2.
+ *  2. A real momentum-conserving shallow-water step, edge by edge: each
+ *     edge has its own velocity, accelerated by the surface-height (bed +
+ *     depth) gradient across it exactly like gravity pulling water
+ *     downhill, then damped by friction. That velocity carries actual
+ *     volume between the two cells — using whichever side is wetter, so a
+ *     wave can wash onto currently-dry ground, but capped by what the
+ *     source side actually holds so nothing siphons out of an already-dry
+ *     cell. This is the *only* way any other cell — including a
+ *     freshly-dug canal, no matter how deep — ever gets water: it has to
+ *     flow in from an already-wet neighbor, exactly like a real dug
+ *     channel only fills once it's actually connected to a water source.
+ *     Because it's momentum-based rather than instant diffusion, a fill or
+ *     a pump kicking on now visibly propagates as a wave and can overshoot
+ *     before settling, instead of snapping straight to equilibrium. A
+ *     climbing stretch still thins out and follows the bed contour (a real
+ *     cascade) instead of pooling, and an isolated, not-yet-connected dig
+ *     still just stays dry — placing a canal tile carves a trench, nothing
+ *     more; the water arriving there is purely a consequence of rule 2.
  *
  * Rendered as one continuous mesh built straight from the same grid — no
  * per-tile quads, no static "sea level" plane.
@@ -193,14 +225,19 @@ export class WaterField {
    * from "a hole someone dug" — see rule 1 above. */
   private readonly originalHeights: Float32Array;
   private depth: Float32Array;
-  private scratch: Float32Array;
+  /** Real physical velocity carried by each edge of the grid (world
+   * units/sec), not a display value — this is the state that gives the sim
+   * momentum. X-edges connect (iy,ix)-(iy,ix+1), sized GRID*(GRID-1);
+   * Z-edges connect (iy,ix)-(iy+1,ix), sized (GRID-1)*GRID. */
+  private readonly velEdgeX: Float32Array;
+  private readonly velEdgeZ: Float32Array;
   /** Smoothed per-vertex flow display (world-space x/z), decayed and refed
-   * each step from the instant diffusion amounts below — purely cosmetic,
+   * each step from the instant mass-flux amounts below — purely cosmetic,
    * drives the flow-direction ripple in the shader. */
   private readonly flowX: Float32Array;
   private readonly flowZ: Float32Array;
-  /** Scratch accumulators for this step's raw diffusion flow, reset and
-   * refilled every step() before being folded into flowX/flowZ. */
+  /** Scratch accumulators for this step's raw mass flux, reset and refilled
+   * every step() before being folded into flowX/flowZ. */
   private readonly instantFlowX: Float32Array;
   private readonly instantFlowZ: Float32Array;
   private time = 0;
@@ -218,7 +255,8 @@ export class WaterField {
     this.terrain = terrain;
     this.originalHeights = terrain.heights.slice();
     this.depth = new Float32Array(GRID * GRID);
-    this.scratch = new Float32Array(GRID * GRID);
+    this.velEdgeX = new Float32Array(GRID * (GRID - 1));
+    this.velEdgeZ = new Float32Array((GRID - 1) * GRID);
     this.flowX = new Float32Array(GRID * GRID);
     this.flowZ = new Float32Array(GRID * GRID);
     this.instantFlowX = new Float32Array(GRID * GRID);
@@ -258,68 +296,86 @@ export class WaterField {
   step(dt: number): void {
     const heights = this.terrain.heights;
     const depth = this.depth;
-    const next = this.scratch;
-    next.set(depth);
 
     // Pass 1: relax towards being filled — but only for a cell that was
     // *naturally* underwater at generation (see originalHeights). A dug
     // cell — road, track, or canal, doesn't matter, and regardless of how
     // far below sea level it was carved — gets nothing here; whatever
     // depth it holds came purely from Pass 2 flowing in from a neighbor,
-    // and can flow back out again just as easily.
+    // and can flow back out again just as easily. Mutates `depth` directly
+    // (no scratch buffer needed) since each cell's target depends only on
+    // its own bed height, never a neighbor's.
     for (let i = 0; i < heights.length; i++) {
       if (this.originalHeights[i] >= WATER_LEVEL) continue;
       const target = Math.max(0, WATER_LEVEL - heights[i]);
-      next[i] += (target - next[i]) * Math.min(1, SEA_RELAX_RATE * dt);
+      depth[i] += (target - depth[i]) * Math.min(1, SEA_RELAX_RATE * dt);
     }
 
-    // Pass 2: neighbor diffusion (4-connected), continuing from the
-    // relaxed state above so both effects compose in one step. Mutates
-    // `next` in place as it sweeps (a cell already touched this pass feeds
-    // its updated value into the next edge) rather than double-buffering —
-    // equivalent to a Gauss-Seidel update, which stays stable here and
-    // self-corrects a cell touched by multiple edges within the same pass.
-    //
-    // Flow is driven by the surface-height (bed + depth) difference, but
-    // capped to whatever depth the upstream side actually holds — two
-    // bone-dry cells always have *some* bed-height difference (that's just
-    // bare terrain slope), and without this cap that alone would compute a
-    // nonzero "flow" and slowly leak phantom water across dry ground with
-    // no real source anywhere nearby.
+    // Pass 2: momentum-conserving shallow water, two sweeps over the edge
+    // grid.
+    const velEdgeX = this.velEdgeX;
+    const velEdgeZ = this.velEdgeZ;
+
+    // Sweep A: accelerate every edge's velocity from the surface-height
+    // (bed + depth) gradient across it, damped by friction. Read-only
+    // against depth/heights, so every edge sees the same pre-step surface
+    // field no matter what order they're visited in.
+    for (let iy = 0; iy < GRID; iy++) {
+      for (let ix = 0; ix < GRID - 1; ix++) {
+        const e = edgeIdxX(iy, ix);
+        const i = idx(iy, ix);
+        const j = idx(iy, ix + 1);
+        velEdgeX[e] = updateEdgeVelocity(velEdgeX[e], heights[i] + depth[i], heights[j] + depth[j], depth[i], depth[j], dt);
+      }
+    }
+    for (let iy = 0; iy < GRID - 1; iy++) {
+      for (let ix = 0; ix < GRID; ix++) {
+        const e = edgeIdxZ(iy, ix);
+        const i = idx(iy, ix);
+        const j = idx(iy + 1, ix);
+        velEdgeZ[e] = updateEdgeVelocity(velEdgeZ[e], heights[i] + depth[i], heights[j] + depth[j], depth[i], depth[j], dt);
+      }
+    }
+
+    // Sweep B: continuity — apply each edge's mass flux to depth, using
+    // whichever side is wetter as the source (so a wave can wash onto
+    // currently-dry ground) and capped by what that source side actually
+    // holds (so nothing siphons depth out of an already-dry cell). Mutates
+    // `depth` in place as it sweeps — Gauss-Seidel style, same as the old
+    // diffusion pass — which stays stable here for the same reason it did
+    // before: a cell touched by multiple edges within one pass just
+    // self-corrects using its own most current value.
     const instantFlowX = this.instantFlowX;
     const instantFlowZ = this.instantFlowZ;
     instantFlowX.fill(0);
     instantFlowZ.fill(0);
 
     for (let iy = 0; iy < GRID; iy++) {
-      for (let ix = 0; ix < GRID; ix++) {
+      for (let ix = 0; ix < GRID - 1; ix++) {
+        const e = edgeIdxX(iy, ix);
         const i = idx(iy, ix);
-        if (ix + 1 < GRID) {
-          const j = idx(iy, ix + 1);
-          const diff = heights[i] + next[i] - (heights[j] + next[j]);
-          let flow = Math.sign(diff) * Math.min(Math.abs(diff) * FLOW_RATE * dt, Math.abs(diff) / 2);
-          flow = flow > 0 ? Math.min(flow, next[i]) : Math.max(flow, -next[j]);
-          next[i] -= flow;
-          next[j] += flow;
-          // Positive flow moves from i to j, i.e. in the +x direction — record
-          // that at both endpoints as a (purely cosmetic) local flow vector.
-          instantFlowX[i] += flow;
-          instantFlowX[j] += flow;
-        }
-        if (iy + 1 < GRID) {
-          const j = idx(iy + 1, ix);
-          const diff = heights[i] + next[i] - (heights[j] + next[j]);
-          let flow = Math.sign(diff) * Math.min(Math.abs(diff) * FLOW_RATE * dt, Math.abs(diff) / 2);
-          flow = flow > 0 ? Math.min(flow, next[i]) : Math.max(flow, -next[j]);
-          next[i] -= flow;
-          next[j] += flow;
-          instantFlowZ[i] += flow;
-          instantFlowZ[j] += flow;
-        }
+        const j = idx(iy, ix + 1);
+        // Positive flow moves from i to j, i.e. in the +x direction — record
+        // that at both endpoints as a (purely cosmetic) local flow vector.
+        const flow = applyEdgeFlux(velEdgeX, e, depth, i, j, dt);
+        instantFlowX[i] += flow;
+        instantFlowX[j] += flow;
+      }
+    }
+    for (let iy = 0; iy < GRID - 1; iy++) {
+      for (let ix = 0; ix < GRID; ix++) {
+        const e = edgeIdxZ(iy, ix);
+        const i = idx(iy, ix);
+        const j = idx(iy + 1, ix);
+        const flow = applyEdgeFlux(velEdgeZ, e, depth, i, j, dt);
+        instantFlowZ[i] += flow;
+        instantFlowZ[j] += flow;
       }
     }
 
-    for (let i = 0; i < next.length; i++) depth[i] = Math.max(0, next[i]);
+    // Belt-and-suspenders against float error — every edge flux above is
+    // already individually capped to never push a cell negative.
+    for (let i = 0; i < depth.length; i++) depth[i] = Math.max(0, depth[i]);
 
     // Fold this step's raw flow into the smoothed display vectors — decay
     // the old value towards zero, then add the fresh amount, so a vertex
@@ -528,6 +584,70 @@ export class WaterField {
     (geometry.attributes.waterFlow as THREE.BufferAttribute).needsUpdate = true;
     geometry.computeBoundingSphere();
   }
+}
+
+/**
+ * Accelerates one edge's velocity from the surface-height (bed + depth)
+ * gradient across it — the momentum equation `∂u/∂t = -g·∂η/∂x - c·u` — and
+ * returns the damped, speed-capped result. `v` is signed: positive means
+ * flow from the i-side toward the j-side.
+ *
+ * If both sides are dry, skips the gravity term entirely and just decays v
+ * toward zero — otherwise bare terrain slope alone (heights differ even at
+ * zero depth) would keep accelerating a velocity that applyEdgeFlux() can
+ * never actually turn into flow anyway (no depth to draw from), wasting a
+ * step's worth of pointless compute and oscillation.
+ */
+function updateEdgeVelocity(
+  v: number,
+  etaI: number,
+  etaJ: number,
+  depthI: number,
+  depthJ: number,
+  dt: number,
+): number {
+  const wetDepth = Math.max(depthI, depthJ);
+  if (wetDepth < MIN_DEPTH) return v * Math.max(0, 1 - WAVE_DAMPING * dt);
+  const accel = (WAVE_GRAVITY * (etaI - etaJ)) / SPACING - WAVE_DAMPING * v;
+  const next = v + accel * dt;
+  const cap = MAX_SPEED_FACTOR * Math.sqrt(WAVE_GRAVITY * wetDepth);
+  return THREE.MathUtils.clamp(next, -cap, cap);
+}
+
+/**
+ * Applies one edge's velocity as an actual mass transfer between its two
+ * cells (finite-volume form: flow = v·depthUpwind·dt/SPACING), using
+ * whichever side is upwind (the direction v points away from) as the
+ * source, and returns the signed depth amount transferred (i to j positive)
+ * for the caller's cosmetic flow-display accumulation.
+ *
+ * The transfer is capped to what the source side actually holds, exactly
+ * like the old diffusion pass was — critical here too, since nothing else
+ * stops a fast-moving edge from trying to draw more depth than exists. When
+ * that cap bites, the edge's own velocity is bled down by the same
+ * fraction: otherwise it would keep pushing at full strength against a
+ * "wall" that isn't really there, and the instant that source cell gets any
+ * depth from elsewhere, the pent-up velocity would dump a whole step's
+ * worth of flow into it in one go.
+ */
+function applyEdgeFlux(
+  vel: Float32Array,
+  e: number,
+  depth: Float32Array,
+  i: number,
+  j: number,
+  dt: number,
+): number {
+  const v = vel[e];
+  if (v === 0) return 0;
+  const upwindDepth = v > 0 ? depth[i] : depth[j];
+  const flow = (v * upwindDepth * dt) / SPACING;
+  if (flow === 0) return 0;
+  const clamped = flow > 0 ? Math.min(flow, depth[i]) : Math.max(flow, -depth[j]);
+  if (clamped !== flow) vel[e] *= clamped / flow;
+  depth[i] -= clamped;
+  depth[j] += clamped;
+  return clamped;
 }
 
 function writeTri(
