@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
-import { recenterTemplateGeometry } from "./network";
+import { recenterTemplateGeometry, TILE_SIZE } from "./network";
 
 export interface RoadAssets {
   straight: THREE.Object3D;
@@ -94,7 +94,28 @@ export async function loadAssets(): Promise<AssetLibrary> {
   // so they drop into the same centered-template convention buildKenneyMesh
   // assumes for every other tile kind.
   recenterTemplateGeometry(trackStraight, new THREE.Box3().setFromObject(trackStraight).getCenter(new THREE.Vector3()));
-  recenterTemplateGeometry(trackCurve, new THREE.Box3().setFromObject(trackCurve).getCenter(new THREE.Vector3()));
+  // The curve piece can't use a plain bbox-center pivot the way the straight
+  // piece does: its "large radius" sweep legitimately bulges past the tile
+  // square by ~0.487 units on the north/east side only (verified straight
+  // from the GLB's raw POSITION accessor: min [-4.0, 0, ~0], max [0.487,
+  // 0.1, 4.487] — two of those four bounds are exact tile-edge numbers, the
+  // other two aren't). Averaging that asymmetric bbox drags the pivot
+  // ~0.24 units off the true tile center on both axes, and because
+  // recenterTemplateGeometry bakes that pivot into the mesh's local vertex
+  // positions *before* the per-placement rotation is applied, the error
+  // rotates along with the piece at every orientation — every placed curve
+  // ends up with its rail geometry shifted toward the corner it's NOT
+  // connecting to, gapping away from the two edges (its actual N/E
+  // connections) it's supposed to meet flush. This is what actually reads
+  // as "the curve faces the wrong way", independent of and undiscovered by
+  // the two earlier commits that only debated the rotation constant. Anchor
+  // the pivot on the two genuinely tile-aligned min faces instead, so it
+  // lands on the true tile center regardless of the bulge.
+  const curveBox = new THREE.Box3().setFromObject(trackCurve);
+  recenterTemplateGeometry(
+    trackCurve,
+    new THREE.Vector3(curveBox.min.x + TILE_SIZE / 2, curveBox.getCenter(new THREE.Vector3()).y, curveBox.min.z + TILE_SIZE / 2),
+  );
 
   return {
     carScene,
