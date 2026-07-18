@@ -232,9 +232,21 @@ const BRIDGE_PIER_WIDTH = 1.0;
  * are both world-space heights; the deck is drawn in the tile's own local
  * space (where local y=0 already corresponds to deckY, since that's what
  * the tile group's own position.y is set to), so the pier's local extent is
- * derived from the *difference* between the two.
+ * derived from the *difference* between the two. `pitch` tilts the whole
+ * assembly (deck, railings, and the arch/piers together, as one rigid
+ * body) around the tile's own local origin — the same way an ordinary
+ * sloped straight tile's mesh tilts around its own center via
+ * buildKenneyMesh — so a bridge whose two connected ends sit at different
+ * heights ramps smoothly between them instead of always sitting dead flat
+ * and stair-stepping at each seam.
  */
-export function buildArchBridgeMesh(axisIsZ: boolean, deckY: number, bedY: number, style: ArchBridgeStyle): THREE.Object3D {
+export function buildArchBridgeMesh(
+  axisIsZ: boolean,
+  deckY: number,
+  bedY: number,
+  style: ArchBridgeStyle,
+  pitch = 0,
+): THREE.Object3D {
   const group = new THREE.Group();
   const deckMat = new THREE.MeshStandardMaterial({ color: style.deckColor, roughness: 0.85, metalness: 0.05 });
   const pierMat = new THREE.MeshStandardMaterial({ color: style.pierColor, roughness: 0.9, metalness: 0.02 });
@@ -308,6 +320,9 @@ export function buildArchBridgeMesh(axisIsZ: boolean, deckY: number, bedY: numbe
       group.add(pier);
     }
   }
+
+  if (axisIsZ) group.rotation.x = pitch;
+  else group.rotation.z = -pitch;
 
   return group;
 }
@@ -453,6 +468,21 @@ export abstract class TileNetwork<TKind extends string> {
   protected gradesTerrain(_kind: TKind): boolean {
     return true;
   }
+  /**
+   * Terrain-sampled height at a tile's own edge midpoint, in direction
+   * `dir` — the height computeSlope ramps a straight tile's low/high ends
+   * toward. Default samples the ground directly. A bridge overrides this to
+   * read its connected neighbor's own edge height instead (via
+   * edgeHeightTowards) so it ramps to match whatever it's actually
+   * connected to — possibly at a different elevation on each end — instead
+   * of always sampling the (irrelevant, since a bridge ignores the ground)
+   * terrain below it and either sitting flat or matching the wrong thing.
+   */
+  protected slopeSourceHeight(cell: Cell, _kind: TKind, dir: number): number {
+    const center = cellCenter(cell);
+    const { dc, dr } = DIRS[dir];
+    return this.terrain.getHeightAt(center.x + (dc * TILE_SIZE) / 2, center.z + (dr * TILE_SIZE) / 2);
+  }
   /** Hook for a subclass to attach an extra physics body when a tile is placed (e.g. a ramp's launch collider). Store it on tile.extraBody so re-grades keep it flush. */
   protected onTilePlaced(_tile: { group: THREE.Group; cell: Cell; facing: number; setExtraBody: (b: RAPIER.RigidBody) => void }, _kind: TKind): void {}
   /** Extra pathfinding edges beyond orthogonal neighbors (e.g. a ramp's 2-tile jump). */
@@ -569,7 +599,7 @@ export abstract class TileNetwork<TKind extends string> {
    * height to its high edge's, capped to MAX_GRADE_PITCH. Junction shapes
    * (bends/T/4-way) return null and stay flat.
    */
-  private computeSlope(cell: Cell, shapeMask: boolean[]): SlopeInfo | null {
+  private computeSlope(cell: Cell, kind: TKind, shapeMask: boolean[]): SlopeInfo | null {
     const dirs = [0, 1, 2, 3].filter((d) => shapeMask[d]);
     let axisIsZ: boolean;
     if (dirs.length === 1) {
@@ -580,17 +610,10 @@ export abstract class TileNetwork<TKind extends string> {
       return null;
     }
 
-    const center = cellCenter(cell);
     const loDir = axisIsZ ? 2 : 3;
     const hiDir = axisIsZ ? 0 : 1;
-    const lo = this.terrain.getHeightAt(
-      center.x + (DIRS[loDir].dc * TILE_SIZE) / 2,
-      center.z + (DIRS[loDir].dr * TILE_SIZE) / 2,
-    );
-    const rawHi = this.terrain.getHeightAt(
-      center.x + (DIRS[hiDir].dc * TILE_SIZE) / 2,
-      center.z + (DIRS[hiDir].dr * TILE_SIZE) / 2,
-    );
+    const lo = this.slopeSourceHeight(cell, kind, loDir);
+    const rawHi = this.slopeSourceHeight(cell, kind, hiDir);
     const maxDelta = TILE_SIZE * Math.tan(MAX_GRADE_PITCH);
     const hi = lo + THREE.MathUtils.clamp(rawHi - lo, -maxDelta, maxDelta);
     const pitch = Math.atan2(lo - hi, TILE_SIZE);
@@ -604,15 +627,17 @@ export abstract class TileNetwork<TKind extends string> {
    * transport network shares — the actual fix for tiles clipping/floating.
    */
   private gradeCell(cell: Cell, kind: TKind): { flatHeight: number; slope: SlopeInfo | null } {
-    const slope = this.canSlope(kind) ? this.computeSlope(cell, this.tileConnectionMask(cell)) : null;
+    const slope = this.canSlope(kind) ? this.computeSlope(cell, kind, this.tileConnectionMask(cell)) : null;
     const center = cellCenter(cell);
     let flatHeight: number;
     if (slope) {
       const { axisIsZ, loHeight, hiHeight } = slope;
-      this.terrain.flattenForRoad(center.x, center.z, TILE_SIZE / 2, (x, z) => {
-        const t = axisIsZ ? (z - center.z) / (TILE_SIZE / 2) : (x - center.x) / (TILE_SIZE / 2);
-        return THREE.MathUtils.lerp(loHeight, hiHeight, (THREE.MathUtils.clamp(t, -1, 1) + 1) / 2);
-      });
+      if (this.gradesTerrain(kind)) {
+        this.terrain.flattenForRoad(center.x, center.z, TILE_SIZE / 2, (x, z) => {
+          const t = axisIsZ ? (z - center.z) / (TILE_SIZE / 2) : (x - center.x) / (TILE_SIZE / 2);
+          return THREE.MathUtils.lerp(loHeight, hiHeight, (THREE.MathUtils.clamp(t, -1, 1) + 1) / 2);
+        });
+      }
       flatHeight = (loHeight + hiHeight) / 2;
     } else {
       flatHeight = this.targetFlatHeight(cell, kind, this.connectionMask(cell));

@@ -68,17 +68,44 @@ const TIE_WIDTH = 0.9;
 const TIE_DEPTH = 0.075;
 const TIE_HEIGHT = 0.03;
 
-const railMaterial = new THREE.MeshStandardMaterial({ color: 0x8b909b, roughness: 0.35, metalness: 0.75 });
-const tieMaterial = new THREE.MeshStandardMaterial({ color: 0x4a3524, roughness: 0.95 });
-const bedMaterial = new THREE.MeshStandardMaterial({ color: 0x6b6459, roughness: 1 });
+// Sampled directly off a rendered Kenney straight piece (not guessed): the
+// old values (0x8b909b rail, 0x4a3524 tie) were never actually cross-checked
+// against the asset they're supposed to match, so a curve or junction never
+// really blended into a straight even once the geometry lined up.
+const railMaterial = new THREE.MeshStandardMaterial({ color: 0x8089ad, roughness: 0.35, metalness: 0.6 });
+const tieMaterial = new THREE.MeshStandardMaterial({ color: 0xa5694e, roughness: 0.85 });
+const bedMaterial = new THREE.MeshStandardMaterial({ color: 0x8a8478, roughness: 1 });
+
+// How far each arm's rails/ties stop short of the tile center, in world
+// units — matters for two reasons. First, letting rails run all the way to
+// the center meant an N/S arm's rails (fixed at x=+-RAIL_GAUGE) sliced
+// straight through an E/W arm's rails (fixed at z=+-RAIL_GAUGE) right
+// around the middle, on any junction with arms on both axes — visible as a
+// crosshatched box instead of tracks converging on a point. Insetting
+// leaves a small gap that a flat hub pad (see buildJunctionTile) fills
+// instead, so arms visually meet at the center without their actual
+// geometry crossing. Second — and this is what actually made a junction
+// look broken rather than just busy — buildRailArm's positions/dimensions
+// are real world units exactly like buildCurveTrack's (RAIL_GAUGE, tie
+// sizes, etc. were all measured directly off the rendered Kenney straight,
+// see the constants above), but buildJunctionTile used to additionally
+// scale its whole group by TILE_SIZE (4x) on top of that, inherited from
+// when these were small pre-scale fractions — quadrupling every dimension
+// and turning what should read as a rail crossing into an oversized brown
+// slab. Both functions now build in the same real-world-unit space with no
+// extra group scale, matching how the curve already worked correctly.
+const ARM_INSET = 0.6;
 
 function buildRailArm(dir: number): THREE.Group {
   const { dc, dr } = DIRS[dir];
   const isNS = dc === 0;
   const arm = new THREE.Group();
+  const half = TILE_SIZE / 2;
+  const armLength = half - ARM_INSET;
+  const armMid = ARM_INSET + armLength / 2;
 
   for (let i = 1; i <= TIE_COUNT; i++) {
-    const t = (i / (TIE_COUNT + 0.5)) * 0.5;
+    const t = ARM_INSET + (i / (TIE_COUNT + 0.5)) * armLength;
     const tieGeo = isNS
       ? new THREE.BoxGeometry(TIE_WIDTH, TIE_HEIGHT, TIE_DEPTH)
       : new THREE.BoxGeometry(TIE_DEPTH, TIE_HEIGHT, TIE_WIDTH);
@@ -91,11 +118,11 @@ function buildRailArm(dir: number): THREE.Group {
 
   for (const side of [-1, 1]) {
     const railGeo = isNS
-      ? new THREE.BoxGeometry(RAIL_WIDTH, RAIL_HEIGHT, 0.5)
-      : new THREE.BoxGeometry(0.5, RAIL_HEIGHT, RAIL_WIDTH);
+      ? new THREE.BoxGeometry(RAIL_WIDTH, RAIL_HEIGHT, armLength)
+      : new THREE.BoxGeometry(armLength, RAIL_HEIGHT, RAIL_WIDTH);
     const rail = new THREE.Mesh(railGeo, railMaterial);
-    const x = isNS ? side * RAIL_GAUGE : dc * 0.25;
-    const z = isNS ? dr * 0.25 : side * RAIL_GAUGE;
+    const x = isNS ? side * RAIL_GAUGE : dc * armMid;
+    const z = isNS ? dr * armMid : side * RAIL_GAUGE;
     rail.position.set(x, RAIL_HEIGHT / 2 + BED_HEIGHT, z);
     rail.castShadow = true;
     arm.add(rail);
@@ -172,14 +199,25 @@ function buildCurveTrack(dirs: [number, number]): THREE.Object3D {
   return group;
 }
 
+// A modest pad under the crossing — a bit wider than a tie (TIE_WIDTH) so
+// it peeks out from underneath, not a near-full-tile slab.
+const JUNCTION_BED_SIZE = 1.3;
+
 function buildJunctionTile(dirs: number[]): THREE.Object3D {
   const group = new THREE.Group();
-  const bed = new THREE.Mesh(new THREE.BoxGeometry(0.92, BED_HEIGHT, 0.92), bedMaterial);
+  const bed = new THREE.Mesh(new THREE.BoxGeometry(JUNCTION_BED_SIZE, BED_HEIGHT, JUNCTION_BED_SIZE), bedMaterial);
   bed.position.y = BED_HEIGHT / 2;
   bed.receiveShadow = true;
   group.add(bed);
+  // Fills the small gap each arm's rails/ties now stop short of (see
+  // ARM_INSET) so the junction still reads as one continuous convergence
+  // point instead of a visible hole at the center.
+  const hub = new THREE.Mesh(new THREE.BoxGeometry(ARM_INSET * 1.5, TIE_HEIGHT, ARM_INSET * 1.5), tieMaterial);
+  hub.position.y = TIE_HEIGHT / 2 + BED_HEIGHT;
+  hub.castShadow = true;
+  hub.receiveShadow = true;
+  group.add(hub);
   for (const d of dirs) group.add(buildRailArm(d));
-  group.scale.setScalar(TILE_SIZE);
   return group;
 }
 
@@ -203,7 +241,7 @@ export class TrackSystem extends TileNetwork<TrackKind> {
   }
 
   protected buildMesh(kind: TrackKind, _facing: number, mask: boolean[], cell: Cell, pitch: number): THREE.Object3D {
-    if (kind === TrackKind.Bridge) return this.buildBridgeMesh(cell, mask);
+    if (kind === TrackKind.Bridge) return this.buildBridgeMesh(cell, mask, pitch);
     const dirs = [0, 1, 2, 3].filter((d) => mask[d]);
     if (dirs.length >= 3) return buildJunctionTile(dirs);
     if (dirs.length === 2) {
@@ -216,18 +254,27 @@ export class TrackSystem extends TileNetwork<TrackKind> {
     return buildStraightTrack(true, pitch, this.trackAssets); // isolated tile: default N/S stub
   }
 
-  private buildBridgeMesh(cell: Cell, mask: boolean[]): THREE.Object3D {
+  private buildBridgeMesh(cell: Cell, mask: boolean[], pitch: number): THREE.Object3D {
     const dirs = [0, 1, 2, 3].filter((d) => mask[d]);
     const axisIsZ = dirs.length > 0 ? dirs[0] % 2 === 0 : true;
     const center = cellCenter(cell);
     const deckY = this.tileHeight(cell) ?? this.terrain.getHeightAt(center.x, center.z);
     const bedY = this.terrain.getHeightAt(center.x, center.z);
-    return buildArchBridgeMesh(axisIsZ, deckY, bedY, {
-      deckColor: TRACK_BRIDGE_DECK_COLOR,
-      pierColor: TRACK_BRIDGE_PIER_COLOR,
-      deckWidth: TRACK_BRIDGE_DECK_WIDTH,
-      railing: false,
-    });
+    const group = new THREE.Group();
+    group.add(
+      buildArchBridgeMesh(
+        axisIsZ,
+        deckY,
+        bedY,
+        { deckColor: TRACK_BRIDGE_DECK_COLOR, pierColor: TRACK_BRIDGE_PIER_COLOR, deckWidth: TRACK_BRIDGE_DECK_WIDTH, railing: false },
+        pitch,
+      ),
+    );
+    // Same idea as the road bridge: the arch is just the structural
+    // slab/support — lay actual rails on top so a train bridge doesn't read
+    // as a bare platform with nothing to ride on.
+    group.add(buildStraightTrack(axisIsZ, pitch, this.trackAssets));
+    return group;
   }
 
   protected buildsCurbs(): boolean {
@@ -238,8 +285,12 @@ export class TrackSystem extends TileNetwork<TrackKind> {
     return false;
   }
 
-  protected canSlope(kind: TrackKind): boolean {
-    return kind !== TrackKind.Bridge;
+  /** A bridge ramps to match whatever it's connected to at each end (possibly a different height on each side) instead of sampling the ground/water it's spanning over. */
+  protected slopeSourceHeight(cell: Cell, kind: TrackKind, dir: number): number {
+    if (kind !== TrackKind.Bridge) return super.slopeSourceHeight(cell, kind, dir);
+    const { dc, dr } = DIRS[dir];
+    const neighborEdge = this.edgeHeightTowards({ col: cell.col + dc, row: cell.row + dr }, (dir + 2) % 4);
+    return neighborEdge ?? super.slopeSourceHeight(cell, kind, dir);
   }
 
   protected requiresDryLand(kind: TrackKind): boolean {

@@ -175,7 +175,15 @@ export class RoadSystem extends TileNetwork<RoadKind> {
   }
 
   protected canSlope(kind: RoadKind): boolean {
-    return kind !== RoadKind.Ramp && kind !== RoadKind.Crossroad && kind !== RoadKind.Bridge;
+    return kind !== RoadKind.Ramp && kind !== RoadKind.Crossroad;
+  }
+
+  /** A bridge ramps to match whatever it's connected to at each end (possibly a different height on each side) instead of sampling the ground/water it's spanning over. */
+  protected slopeSourceHeight(cell: Cell, kind: RoadKind, dir: number): number {
+    if (kind !== RoadKind.Bridge) return super.slopeSourceHeight(cell, kind, dir);
+    const { dc, dr } = DIRS[dir];
+    const neighborEdge = this.edgeHeightTowards({ col: cell.col + dc, row: cell.row + dr }, (dir + 2) % 4);
+    return neighborEdge ?? super.slopeSourceHeight(cell, kind, dir);
   }
 
   protected isAlwaysOpen(kind: RoadKind): boolean {
@@ -219,7 +227,7 @@ export class RoadSystem extends TileNetwork<RoadKind> {
 
   protected buildMesh(kind: RoadKind, facing: number, mask: boolean[], cell: Cell, pitch: number): THREE.Object3D {
     if (kind === RoadKind.Ramp) return buildRampMesh(facing, this.roadAssets);
-    if (kind === RoadKind.Bridge) return this.buildBridgeMesh(cell, mask);
+    if (kind === RoadKind.Bridge) return this.buildBridgeMesh(cell, mask, pitch);
     // Every third plain "Road" tile (deterministic by position, so it doesn't
     // flicker between rebuilds) gets Kenney's lightpost variant for a bit of
     // streetscape variety instead of only ever using the bare straight piece.
@@ -228,7 +236,7 @@ export class RoadSystem extends TileNetwork<RoadKind> {
     return buildKenneyShapeMesh(mask, cell, pitch, this.roadAssets, TILE_TARGET_COLOR[kind], swatch, useVariant);
   }
 
-  private buildBridgeMesh(cell: Cell, mask: boolean[]): THREE.Object3D {
+  private buildBridgeMesh(cell: Cell, mask: boolean[], pitch: number): THREE.Object3D {
     const dirs = [0, 1, 2, 3].filter((d) => mask[d]);
     // A bridge only ever renders as a straight span, oriented along whichever
     // axis its connection(s) lie on — N/S (dir 0 or 2) or E/W (dir 1 or 3).
@@ -240,12 +248,23 @@ export class RoadSystem extends TileNetwork<RoadKind> {
     const center = cellCenter(cell);
     const deckY = this.tileHeight(cell) ?? this.terrain.getHeightAt(center.x, center.z);
     const bedY = this.terrain.getHeightAt(center.x, center.z);
-    return buildArchBridgeMesh(axisIsZ, deckY, bedY, {
-      deckColor: BRIDGE_DECK_COLOR,
-      pierColor: BRIDGE_PIER_COLOR,
-      deckWidth: BRIDGE_DECK_WIDTH,
-      railing: true,
-    });
+    const group = new THREE.Group();
+    group.add(
+      buildArchBridgeMesh(
+        axisIsZ,
+        deckY,
+        bedY,
+        { deckColor: BRIDGE_DECK_COLOR, pierColor: BRIDGE_PIER_COLOR, deckWidth: BRIDGE_DECK_WIDTH, railing: true },
+        pitch,
+      ),
+    );
+    // The arch structure above is just the structural slab/support — lay the
+    // actual Kenney road surface (lane markings and all) on top, exactly like
+    // a real bridge has pavement laid over its deck, so a bridge doesn't read
+    // as a bare grey platform with no road on it. Reuses the same straight
+    // piece and pitch convention as an ordinary road tile.
+    group.add(buildKenneyMesh(this.roadAssets.straight, axisIsZ ? 0 : Math.PI / 2, TILE_TARGET_COLOR[RoadKind.Standard], CITYBUILDER_SWATCH_LINEAR, pitch));
+    return group;
   }
 
   protected onTilePlaced(
