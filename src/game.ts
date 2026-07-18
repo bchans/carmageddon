@@ -39,8 +39,12 @@ const ROAD_LABELS: Record<RoadKind, string> = {
   [RoadKind.Standard]: "Road",
   [RoadKind.Crossroad]: "Crossroad",
   [RoadKind.Ramp]: "Ramp",
+  [RoadKind.Bridge]: "Bridge",
 };
-const TRACK_LABELS: Record<TrackKind, string> = { [TrackKind.Standard]: "Track" };
+const TRACK_LABELS: Record<TrackKind, string> = {
+  [TrackKind.Standard]: "Track",
+  [TrackKind.Bridge]: "Bridge",
+};
 // Ship mode has two tools, not a set of tile "kinds" — a repeatable dig
 // (see CanalSystem) and a directional pump (see PumpSystem) — selected the
 // same way a road/track kind is, via the build panel. Car mode similarly has
@@ -483,8 +487,11 @@ export class Game {
       return;
     }
 
-    const network = this.activeTransport === "car" ? this.roads : this.tracks;
-    if (!network.canPlace(cell)) {
+    const canPlaceHere =
+      this.activeTransport === "car"
+        ? this.roads.canPlace(cell, this.selectedBuildKind as RoadKind)
+        : this.tracks.canPlace(cell, this.selectedBuildKind as TrackKind);
+    if (!canPlaceHere) {
       this.hud.showMessage("Can't place there — must connect to your network, and stay off other transports' tiles.");
       return;
     }
@@ -531,7 +538,10 @@ export class Game {
     const center = network.cellWorldCenter(cell);
     this.hoverMarker.position.set(center.x, center.y + 0.1, center.z);
     this.hoverMarker.visible = true;
-    const ok = network.canPlace(cell);
+    const ok =
+      this.activeTransport === "car"
+        ? this.roads.canPlace(cell, this.selectedBuildKind as RoadKind)
+        : this.tracks.canPlace(cell, this.selectedBuildKind as TrackKind);
     (this.hoverMarker.material as THREE.MeshBasicMaterial).color.set(ok ? 0x4ade80 : 0xef4444);
   }
 

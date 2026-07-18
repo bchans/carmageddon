@@ -3,16 +3,34 @@ import type RAPIER from "@dimforge/rapier3d-compat";
 import type { Rapier } from "./physics";
 import type { Terrain } from "./terrain";
 import type { TrackAssets } from "./assets";
-import { TileNetwork, TILE_SIZE, DIRS, type Cell, buildKenneyMesh, curveRotationSteps } from "./network";
+import {
+  TileNetwork,
+  TILE_SIZE,
+  DIRS,
+  cellCenter,
+  type Cell,
+  buildKenneyMesh,
+  curveRotationSteps,
+  buildArchBridgeMesh,
+} from "./network";
 
 export const TrackKind = {
   Standard: "standard",
+  Bridge: "bridge",
 } as const;
 export type TrackKind = (typeof TrackKind)[keyof typeof TrackKind];
 
 export const TRACK_SPEED_MULTIPLIER: Record<TrackKind, number> = {
   [TrackKind.Standard]: 1,
+  [TrackKind.Bridge]: 1,
 };
+
+// A brick arch bridge for trains — same span mechanic as the road bridge
+// (see roads.ts), narrower deck and a warmer brick-red support color
+// instead of concrete grey.
+const TRACK_BRIDGE_DECK_WIDTH = 1.6;
+const TRACK_BRIDGE_DECK_COLOR = 0x8a8478; // ballast/stone deck edge
+const TRACK_BRIDGE_PIER_COLOR = 0x8a3a2e; // brick red
 
 // Kenney's train kit (real assets — kenney.nl itself is blocked from this
 // sandbox, but the user supplied the kit directly) is already authored at
@@ -129,7 +147,8 @@ export class TrackSystem extends TileNetwork<TrackKind> {
     return TRACK_SPEED_MULTIPLIER[kind];
   }
 
-  protected buildMesh(_kind: TrackKind, _facing: number, mask: boolean[], _cell: Cell, pitch: number): THREE.Object3D {
+  protected buildMesh(kind: TrackKind, _facing: number, mask: boolean[], cell: Cell, pitch: number): THREE.Object3D {
+    if (kind === TrackKind.Bridge) return this.buildBridgeMesh(cell, mask);
     const dirs = [0, 1, 2, 3].filter((d) => mask[d]);
     if (dirs.length >= 3) return buildJunctionTile(dirs);
     if (dirs.length === 2) {
@@ -142,11 +161,50 @@ export class TrackSystem extends TileNetwork<TrackKind> {
     return buildStraightTrack(true, pitch, this.trackAssets); // isolated tile: default N/S stub
   }
 
+  private buildBridgeMesh(cell: Cell, mask: boolean[]): THREE.Object3D {
+    const dirs = [0, 1, 2, 3].filter((d) => mask[d]);
+    const axisIsZ = dirs.length > 0 ? dirs[0] % 2 === 0 : true;
+    const center = cellCenter(cell);
+    const deckY = this.tileHeight(cell) ?? this.terrain.getHeightAt(center.x, center.z);
+    const bedY = this.terrain.getHeightAt(center.x, center.z);
+    return buildArchBridgeMesh(axisIsZ, deckY, bedY, {
+      deckColor: TRACK_BRIDGE_DECK_COLOR,
+      pierColor: TRACK_BRIDGE_PIER_COLOR,
+      deckWidth: TRACK_BRIDGE_DECK_WIDTH,
+      railing: false,
+    });
+  }
+
   protected buildsCurbs(): boolean {
     // Trains run on rails, not free-roaming physics — there's no gameplay
     // reason for a car-style solid retaining wall around a track tile's
     // unconnected edges (most visible/ugly at dead-ends, where 3 of the 4
     // sides would get walled in).
     return false;
+  }
+
+  protected canSlope(kind: TrackKind): boolean {
+    return kind !== TrackKind.Bridge;
+  }
+
+  protected requiresDryLand(kind: TrackKind): boolean {
+    return kind !== TrackKind.Bridge;
+  }
+
+  protected gradesTerrain(kind: TrackKind): boolean {
+    return kind !== TrackKind.Bridge;
+  }
+
+  protected targetFlatHeight(cell: Cell, kind: TrackKind, mask: boolean[]): number {
+    if (kind !== TrackKind.Bridge) return super.targetFlatHeight(cell, kind, mask);
+    const neighborHeights: number[] = [];
+    for (let dir = 0; dir < 4; dir++) {
+      if (!mask[dir]) continue;
+      const { dc, dr } = DIRS[dir];
+      const neighborHeight = this.tileHeight({ col: cell.col + dc, row: cell.row + dr });
+      if (neighborHeight !== null) neighborHeights.push(neighborHeight);
+    }
+    if (neighborHeights.length === 0) return super.targetFlatHeight(cell, kind, mask);
+    return neighborHeights.reduce((a, b) => a + b, 0) / neighborHeights.length;
   }
 }

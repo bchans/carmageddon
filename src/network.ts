@@ -203,6 +203,115 @@ export function buildKenneyShapeMesh(
   return buildKenneyMesh(assets.crossroad, 0, targetColorHex, swatchLinear); // 4-way
 }
 
+// --- Arch bridge (shared by road and track bridge kinds) -------------------
+
+export interface ArchBridgeStyle {
+  deckColor: number;
+  pierColor: number;
+  deckWidth: number;
+  railing: boolean;
+}
+
+const BRIDGE_DECK_THICKNESS = 0.35;
+// Piers reach 0.15 below the ground/water bed rather than stopping exactly
+// at it, so the base never visibly floats a hair above whatever's below —
+// matters most over water, where the bed itself is a live, moving surface.
+const BRIDGE_PIER_EMBED = 0.15;
+// Solid pier width, along the travel axis, left at each end of the arch
+// once the archway opening is carved out — enough to read as real
+// stonework/concrete mass, not a paper-thin frame.
+const BRIDGE_PIER_WIDTH = 1.0;
+
+/**
+ * Builds a single-tile arch bridge: a flat deck (fixed elevation, doesn't
+ * follow the terrain/water below) on top of a pier-and-archway support
+ * structure that actually reaches down to the real ground/water bed height,
+ * so the arch always looks structurally grounded regardless of how deep the
+ * gap it's spanning is. `axisIsZ` matches the same convention used for a
+ * regular straight tile — true for a N/S run, false for E/W. `deckY`/`bedY`
+ * are both world-space heights; the deck is drawn in the tile's own local
+ * space (where local y=0 already corresponds to deckY, since that's what
+ * the tile group's own position.y is set to), so the pier's local extent is
+ * derived from the *difference* between the two.
+ */
+export function buildArchBridgeMesh(axisIsZ: boolean, deckY: number, bedY: number, style: ArchBridgeStyle): THREE.Object3D {
+  const group = new THREE.Group();
+  const deckMat = new THREE.MeshStandardMaterial({ color: style.deckColor, roughness: 0.85, metalness: 0.05 });
+  const pierMat = new THREE.MeshStandardMaterial({ color: style.pierColor, roughness: 0.9, metalness: 0.02 });
+
+  const [deckSx, deckSz] = axisIsZ ? [style.deckWidth, TILE_SIZE] : [TILE_SIZE, style.deckWidth];
+  const deck = new THREE.Mesh(new THREE.BoxGeometry(deckSx, BRIDGE_DECK_THICKNESS, deckSz), deckMat);
+  const deckTopLocalY = DECAL_HEIGHT;
+  deck.position.y = deckTopLocalY - BRIDGE_DECK_THICKNESS / 2;
+  deck.castShadow = true;
+  deck.receiveShadow = true;
+  group.add(deck);
+
+  if (style.railing) {
+    const railGeo = axisIsZ
+      ? new THREE.BoxGeometry(0.12, 0.4, TILE_SIZE)
+      : new THREE.BoxGeometry(TILE_SIZE, 0.4, 0.12);
+    const off = style.deckWidth / 2 - 0.06;
+    for (const side of [-1, 1]) {
+      const rail = new THREE.Mesh(railGeo, pierMat);
+      if (axisIsZ) rail.position.set(side * off, deckTopLocalY + 0.2, 0);
+      else rail.position.set(0, deckTopLocalY + 0.2, side * off);
+      rail.castShadow = true;
+      group.add(rail);
+    }
+  }
+
+  // Support wall: a 2D profile — a rectangular pier block with a
+  // semicircular archway notched out of its bottom-center — extruded across
+  // the deck's width. Profile axes are (travel axis, vertical); the whole
+  // shape is authored as if axisIsZ were false (travel along local X) and
+  // rotated 90° around Y afterwards for a Z-axis run, so the arch math only
+  // has to be written once.
+  const pierBottomLocalY = bedY - deckY - BRIDGE_PIER_EMBED;
+  const archTopLocalY = deckTopLocalY - BRIDGE_DECK_THICKNESS;
+  const totalHeight = archTopLocalY - pierBottomLocalY;
+  const halfLen = TILE_SIZE / 2;
+  const archRadius = Math.min(halfLen - BRIDGE_PIER_WIDTH, totalHeight - 0.3);
+  if (totalHeight > 0.4 && archRadius > 0.3) {
+    const shape = new THREE.Shape();
+    shape.moveTo(-halfLen, 0);
+    shape.lineTo(-halfLen, totalHeight);
+    shape.lineTo(halfLen, totalHeight);
+    shape.lineTo(halfLen, 0);
+    shape.lineTo(archRadius, 0);
+    shape.absarc(0, 0, archRadius, 0, Math.PI, false); // sweeps up and over to (-archRadius, 0)
+    shape.lineTo(-halfLen, 0);
+    const extrudeThickness = Math.min(style.deckWidth * 0.7, 1.4);
+    const archGeo = new THREE.ExtrudeGeometry(shape, { depth: extrudeThickness, bevelEnabled: false });
+    archGeo.translate(0, 0, -extrudeThickness / 2);
+    const archMesh = new THREE.Mesh(archGeo, pierMat);
+    if (axisIsZ) archMesh.rotation.y = Math.PI / 2;
+    archMesh.position.y = pierBottomLocalY;
+    archMesh.castShadow = true;
+    archMesh.receiveShadow = true;
+    group.add(archMesh);
+  } else {
+    // Gap too shallow for a real archway to read clearly (e.g. a bridge
+    // placed over nearly-flat ground) — fall back to two plain rectangular
+    // piers rather than an arch that would look like a slit.
+    const pierHeight = Math.max(0.4, totalHeight);
+    const pierGeo = axisIsZ
+      ? new THREE.BoxGeometry(style.deckWidth * 0.6, pierHeight, BRIDGE_PIER_WIDTH)
+      : new THREE.BoxGeometry(BRIDGE_PIER_WIDTH, pierHeight, style.deckWidth * 0.6);
+    for (const side of [-1, 1]) {
+      const pier = new THREE.Mesh(pierGeo, pierMat);
+      const off = halfLen - BRIDGE_PIER_WIDTH / 2;
+      if (axisIsZ) pier.position.set(0, archTopLocalY - pierHeight / 2, side * off);
+      else pier.position.set(side * off, archTopLocalY - pierHeight / 2, 0);
+      pier.castShadow = true;
+      pier.receiveShadow = true;
+      group.add(pier);
+    }
+  }
+
+  return group;
+}
+
 // --- Generic tile network ---------------------------------------------------
 
 class NetworkTile<TKind extends string> {
@@ -324,8 +433,8 @@ export abstract class TileNetwork<TKind extends string> {
   protected curbColor(_kind: TKind): number {
     return 0x9a9a9a;
   }
-  /** Target flat height for a non-sloped tile; default averages already-connected edges. Canals override to carve a fixed depth instead of matching surrounding terrain. */
-  protected targetFlatHeight(cell: Cell, mask: boolean[]): number {
+  /** Target flat height for a non-sloped tile; default averages already-connected edges. Canals override to carve a fixed depth instead of matching surrounding terrain; a bridge overrides to match its connected neighbor tiles' own heights instead of the ground. */
+  protected targetFlatHeight(cell: Cell, _kind: TKind, mask: boolean[]): number {
     const center = cellCenter(cell);
     const heights: number[] = [];
     for (let dir = 0; dir < 4; dir++) {
@@ -335,6 +444,14 @@ export abstract class TileNetwork<TKind extends string> {
     }
     if (heights.length === 0) return this.terrain.getHeightAt(center.x, center.z);
     return heights.reduce((a, b) => a + b, 0) / heights.length;
+  }
+  /** Whether this kind requires dry land to place — the default for every ordinary tile. A bridge is the one kind meant to span water instead, so it overrides this to false. */
+  protected requiresDryLand(_kind: TKind): boolean {
+    return true;
+  }
+  /** Whether gradeCell should flatten the terrain/water bed under this tile at all. A bridge deliberately leaves the ground/water untouched underneath it — it just holds a fixed elevation over whatever's there, arched supports and all. */
+  protected gradesTerrain(_kind: TKind): boolean {
+    return true;
   }
   /** Hook for a subclass to attach an extra physics body when a tile is placed (e.g. a ramp's launch collider). Store it on tile.extraBody so re-grades keep it flush. */
   protected onTilePlaced(_tile: { group: THREE.Group; cell: Cell; facing: number; setExtraBody: (b: RAPIER.RigidBody) => void }, _kind: TKind): void {}
@@ -410,7 +527,7 @@ export abstract class TileNetwork<TKind extends string> {
     return null;
   }
 
-  canPlace(cell: Cell): boolean {
+  canPlace(cell: Cell, kind: TKind): boolean {
     if (this.tiles.has(cellKey(cell))) return false; // already a tile there
     // Already part of the network on its own (e.g. a canal cell that's
     // naturally underwater) — nothing to dig/pave, and it's already
@@ -420,8 +537,10 @@ export abstract class TileNetwork<TKind extends string> {
     // Never pave a road/track tile directly over water — same rule canals
     // and pumps already apply to their own placement (see CanalSystem.canDig,
     // PumpSystem.canPlace), just never extended to the shared network base.
+    // A bridge is the deliberate exception (see requiresDryLand) — it's
+    // meant to span water instead of being blocked by it.
     const center = cellCenter(cell);
-    if (this.terrain.isUnderwaterAt(center.x, center.z)) return false;
+    if (this.requiresDryLand(kind) && this.terrain.isUnderwaterAt(center.x, center.z)) return false;
     // Half a tile of headroom (not a full tile) is all a centered tile's own
     // footprint needs to still fit on the terrain mesh — anything more just
     // leaves an unusable, unreachable ring around the map that spawn/target
@@ -496,14 +615,16 @@ export abstract class TileNetwork<TKind extends string> {
       });
       flatHeight = (loHeight + hiHeight) / 2;
     } else {
-      flatHeight = this.targetFlatHeight(cell, this.connectionMask(cell));
-      this.terrain.flattenForRoad(center.x, center.z, TILE_SIZE / 2, () => flatHeight);
+      flatHeight = this.targetFlatHeight(cell, kind, this.connectionMask(cell));
+      if (this.gradesTerrain(kind)) {
+        this.terrain.flattenForRoad(center.x, center.z, TILE_SIZE / 2, () => flatHeight);
+      }
     }
     return { flatHeight, slope };
   }
 
   place(cell: Cell, kind: TKind): boolean {
-    if (!this.canPlace(cell)) return false;
+    if (!this.canPlace(cell, kind)) return false;
     const incoming = this.incomingDirection(cell) ?? 0;
     const facing = this.facingForPlacement(incoming);
 

@@ -8,9 +8,11 @@ import {
   TILE_SIZE,
   DIRS,
   cellKey,
+  cellCenter,
   type Cell,
   buildKenneyMesh,
   buildKenneyShapeMesh,
+  buildArchBridgeMesh,
   srgbToLinear,
 } from "./network";
 
@@ -27,8 +29,17 @@ export const RoadKind = {
   Standard: "standard",
   Crossroad: "crossroad",
   Ramp: "ramp",
+  Bridge: "bridge",
 } as const;
 export type RoadKind = (typeof RoadKind)[keyof typeof RoadKind];
+
+// A concrete arch bridge — the deck holds a fixed elevation matching
+// whatever it connects to on each end rather than grading down to the
+// ground/water below (see RoadSystem.targetFlatHeight), on visible arch
+// supports that actually reach down to the real bed height underneath.
+const BRIDGE_DECK_WIDTH = 3.2;
+const BRIDGE_DECK_COLOR = 0xb9b6ad; // concrete
+const BRIDGE_PIER_COLOR = 0x8f8c83; // slightly darker concrete for the support mass
 
 // A highway sign is a modifier placed on an already-built road tile (see
 // RoadSystem.placeSign), not a RoadKind of its own, so this is the only
@@ -58,6 +69,7 @@ const TILE_TARGET_COLOR: Record<RoadKind, number> = {
   [RoadKind.Standard]: 0xacaeb4,
   [RoadKind.Crossroad]: 0xacaeb4,
   [RoadKind.Ramp]: 0xacaeb4,
+  [RoadKind.Bridge]: BRIDGE_DECK_COLOR,
 };
 
 // --- Highway sign -----------------------------------------------------------
@@ -163,7 +175,7 @@ export class RoadSystem extends TileNetwork<RoadKind> {
   }
 
   protected canSlope(kind: RoadKind): boolean {
-    return kind !== RoadKind.Ramp && kind !== RoadKind.Crossroad;
+    return kind !== RoadKind.Ramp && kind !== RoadKind.Crossroad && kind !== RoadKind.Bridge;
   }
 
   protected isAlwaysOpen(kind: RoadKind): boolean {
@@ -175,14 +187,65 @@ export class RoadSystem extends TileNetwork<RoadKind> {
     return dir === facing || dir === (facing + 2) % 4; // launch end and entry end stay open
   }
 
+  protected buildsCurbs(kind: RoadKind): boolean {
+    // A bridge has its own railings (see buildArchBridgeMesh) instead of the
+    // usual solid box curb wall — a plain curb would also nonsensically wall
+    // off the two unconnected sides of a span that's supposed to be open air
+    // over water.
+    return kind !== RoadKind.Bridge;
+  }
+
+  protected requiresDryLand(kind: RoadKind): boolean {
+    return kind !== RoadKind.Bridge;
+  }
+
+  protected gradesTerrain(kind: RoadKind): boolean {
+    return kind !== RoadKind.Bridge;
+  }
+
+  /** A bridge holds the elevation of whatever it's connected to on each end (averaged if both, matched exactly if only one) instead of matching the ground/water beneath it. */
+  protected targetFlatHeight(cell: Cell, kind: RoadKind, mask: boolean[]): number {
+    if (kind !== RoadKind.Bridge) return super.targetFlatHeight(cell, kind, mask);
+    const neighborHeights: number[] = [];
+    for (let dir = 0; dir < 4; dir++) {
+      if (!mask[dir]) continue;
+      const { dc, dr } = DIRS[dir];
+      const neighborHeight = this.tileHeight({ col: cell.col + dc, row: cell.row + dr });
+      if (neighborHeight !== null) neighborHeights.push(neighborHeight);
+    }
+    if (neighborHeights.length === 0) return super.targetFlatHeight(cell, kind, mask);
+    return neighborHeights.reduce((a, b) => a + b, 0) / neighborHeights.length;
+  }
+
   protected buildMesh(kind: RoadKind, facing: number, mask: boolean[], cell: Cell, pitch: number): THREE.Object3D {
     if (kind === RoadKind.Ramp) return buildRampMesh(facing, this.roadAssets);
+    if (kind === RoadKind.Bridge) return this.buildBridgeMesh(cell, mask);
     // Every third plain "Road" tile (deterministic by position, so it doesn't
     // flicker between rebuilds) gets Kenney's lightpost variant for a bit of
     // streetscape variety instead of only ever using the bare straight piece.
     const useVariant = (c: Cell) => kind === RoadKind.Standard && (c.col + c.row * 3) % 3 === 0;
     const swatch = CITYBUILDER_SWATCH_LINEAR;
     return buildKenneyShapeMesh(mask, cell, pitch, this.roadAssets, TILE_TARGET_COLOR[kind], swatch, useVariant);
+  }
+
+  private buildBridgeMesh(cell: Cell, mask: boolean[]): THREE.Object3D {
+    const dirs = [0, 1, 2, 3].filter((d) => mask[d]);
+    // A bridge only ever renders as a straight span, oriented along whichever
+    // axis its connection(s) lie on — N/S (dir 0 or 2) or E/W (dir 1 or 3).
+    // Opposite dirs always share parity, so this works whether it's
+    // connected on both ends already or still just one (e.g. right after
+    // placement, before its far neighbor exists); an isolated tile with no
+    // connections yet has no orientation to go on, so it defaults to N/S.
+    const axisIsZ = dirs.length > 0 ? dirs[0] % 2 === 0 : true;
+    const center = cellCenter(cell);
+    const deckY = this.tileHeight(cell) ?? this.terrain.getHeightAt(center.x, center.z);
+    const bedY = this.terrain.getHeightAt(center.x, center.z);
+    return buildArchBridgeMesh(axisIsZ, deckY, bedY, {
+      deckColor: BRIDGE_DECK_COLOR,
+      pierColor: BRIDGE_PIER_COLOR,
+      deckWidth: BRIDGE_DECK_WIDTH,
+      railing: true,
+    });
   }
 
   protected onTilePlaced(

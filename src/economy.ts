@@ -16,10 +16,12 @@ export const ROAD_COST: Record<RoadKind, number> = {
   [RoadKind.Standard]: 6,
   [RoadKind.Crossroad]: 18,
   [RoadKind.Ramp]: 12,
+  [RoadKind.Bridge]: 24,
 };
 
 export const TRACK_COST: Record<TrackKind, number> = {
   [TrackKind.Standard]: 6,
+  [TrackKind.Bridge]: 20,
 };
 
 // Digging a canal bed is pricier than laying pavement/rail on ground that's
