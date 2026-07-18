@@ -378,19 +378,42 @@ function smooth(heights: Float32Array, passes: number): void {
   }
 }
 
-const ROCK = new THREE.Color(0x8a7a63);
-const GRASS_LOW = new THREE.Color(0x6ab04c);
-const GRASS_HIGH = new THREE.Color(0x4c8a3a);
-const SAND = new THREE.Color(0xe0c383);
 const RIVERBED = new THREE.Color(0x7a5f3d);
+
+// A continuous hypsometric ramp rather than a few flat-colored bands: every
+// stop below is a distinct shade, and any height between two stops lerps
+// smoothly between them, so two different depths both below water (or both
+// dug below the original terrain) read as visibly different colors instead
+// of collapsing into the same flat "sand" or "grass" swatch. Dig depth in
+// particular used to be invisible — CANAL_DIG_STEP*CANAL_MAX_DIG_LEVEL in
+// canals.ts means a dig can go ~4.8 units below its origin, and a shallow
+// scrape vs. a maxed-out gouge used to render identically.
+const ELEVATION_STOPS: Array<[number, THREE.Color]> = [
+  [-8, new THREE.Color(0x241a12)], // deepest dig: near-black mud
+  [-4, new THREE.Color(0x4a3524)], // dark wet clay
+  [-1, new THREE.Color(0x6b4a2c)], // damp dirt
+  [WATER_LEVEL - 0.2, new THREE.Color(0x8a6a3f)], // wet sand at the shoreline
+  [WATER_LEVEL + 0.6, new THREE.Color(0xe0c383)], // dry sand
+  [2.0, new THREE.Color(0x8bc34a)], // bright low grass
+  [3.5, new THREE.Color(0x6ab04c)], // grass
+  [6.0, new THREE.Color(0x4c8a3a)], // deeper grass
+  [10.0, new THREE.Color(0x8a7a63)], // bare rock
+  [16.0, new THREE.Color(0xb9b0a0)], // pale high rock
+  [20.0, new THREE.Color(0xf0efe8)], // snow cap
+];
 
 function colorForHeight(h: number, isRiver: boolean): THREE.Color {
   if (isRiver) return RIVERBED;
-  if (h < WATER_LEVEL + 0.6) return SAND;
-  if (h < 3.5) return GRASS_LOW;
-  if (h < 6) return GRASS_HIGH;
-  const t = THREE.MathUtils.clamp((h - 6) / 8, 0, 1);
-  return GRASS_HIGH.clone().lerp(ROCK, t);
+  if (h <= ELEVATION_STOPS[0][0]) return ELEVATION_STOPS[0][1];
+  for (let i = 1; i < ELEVATION_STOPS.length; i++) {
+    const [hi, ci] = ELEVATION_STOPS[i];
+    if (h <= hi || i === ELEVATION_STOPS.length - 1) {
+      const [hLo, cLo] = ELEVATION_STOPS[i - 1];
+      const t = THREE.MathUtils.clamp((h - hLo) / (hi - hLo), 0, 1);
+      return cLo.clone().lerp(ci, t);
+    }
+  }
+  return ELEVATION_STOPS[ELEVATION_STOPS.length - 1][1];
 }
 
 function worldToGrid(x: number, z: number): { ix: number; iy: number } {
