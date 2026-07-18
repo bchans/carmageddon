@@ -29,6 +29,15 @@ function idx(iy: number, ix: number): number {
 export class Terrain {
   readonly heights: Float32Array;
   readonly isRiver: Uint8Array;
+  /** Cells that are a river/stream headwater — see carveRiver's spring pit.
+   * A spring's bed usually sits well above global WATER_LEVEL (it's up in
+   * the hills), so it needs its own perpetual-source rule independent of
+   * "naturally underwater at global sea level"; see springLevel and
+   * WaterField's spring-relax pass. */
+  readonly isSpring: Uint8Array;
+  /** Valid only where isSpring is set: the water surface height a spring
+   * cell perpetually relaxes toward, regardless of global WATER_LEVEL. */
+  readonly springLevel: Float32Array;
   readonly mesh: THREE.Mesh;
   readonly rigidBody: RAPIER.RigidBody;
   private collider: RAPIER.Collider;
@@ -40,6 +49,8 @@ export class Terrain {
     world: RAPIER.World,
     heights: Float32Array,
     isRiver: Uint8Array,
+    isSpring: Uint8Array,
+    springLevel: Float32Array,
     mesh: THREE.Mesh,
     rigidBody: RAPIER.RigidBody,
     collider: RAPIER.Collider,
@@ -48,6 +59,8 @@ export class Terrain {
     this.world = world;
     this.heights = heights;
     this.isRiver = isRiver;
+    this.isSpring = isSpring;
+    this.springLevel = springLevel;
     this.mesh = mesh;
     this.rigidBody = rigidBody;
     this.collider = collider;
@@ -97,9 +110,11 @@ export class Terrain {
     }
 
     const isRiver = new Uint8Array(GRID * GRID);
+    const isSpring = new Uint8Array(GRID * GRID);
+    const springLevel = new Float32Array(GRID * GRID);
     if (archetype === "river") {
       const riverCount = 1 + Math.floor(rng() * 3); // 1-3
-      for (let r = 0; r < riverCount; r++) carveRiver(heights, isRiver, rng);
+      for (let r = 0; r < riverCount; r++) carveRiver(heights, isRiver, isSpring, springLevel, rng);
     } else if (archetype === "lake") {
       const lakeCount = 1 + Math.floor(rng() * 2); // 1-2
       for (let l = 0; l < lakeCount; l++) carveLake(heights, rng);
@@ -107,7 +122,7 @@ export class Terrain {
       // Highlands: sparse water — a single thin river about half the time,
       // a single small lake otherwise — enough for a ship round to still
       // work without the map reading as anything but dry and rugged.
-      if (rng() < 0.5) carveRiver(heights, isRiver, rng);
+      if (rng() < 0.5) carveRiver(heights, isRiver, isSpring, springLevel, rng);
       else carveLake(heights, rng);
     }
 
@@ -133,7 +148,7 @@ export class Terrain {
     ).setFriction(1.0);
     const collider = world.createCollider(colliderDesc, rigidBody);
 
-    return new Terrain(RAPIER, world, heights, isRiver, mesh, rigidBody, collider);
+    return new Terrain(RAPIER, world, heights, isRiver, isSpring, springLevel, mesh, rigidBody, collider);
   }
 
   /** Bilinear-interpolated terrain height at a world-space (x, z) coordinate. */
@@ -252,7 +267,31 @@ export class Terrain {
   }
 }
 
-function carveRiver(heights: Float32Array, isRiver: Uint8Array, rng: () => number): void {
+// How far below the natural (pre-carve) terrain slope the channel bed sits,
+// at every point along the path — using the *local* terrain height rather
+// than a flat absolute target is what gives the riverbed a real downhill
+// gradient (since the path itself is already a steepest-descent walk, its
+// natural heights are already monotonically non-increasing) instead of
+// carving the whole run flat. That real gradient is what the momentum water
+// sim (see waterField.ts) actually has something to push water down.
+const CHANNEL_DEPTH = 0.6;
+// The pool at the very top of the river — its spring. Cut noticeably
+// deeper than the channel so it reads as a proper standing headwater
+// rather than just where the channel happens to start.
+const SPRING_PIT_RADIUS = 1.5;
+const SPRING_PIT_DEPTH = 0.5;
+// How far below the spring's original (pre-carve) ground level its water
+// surface sits — nearly full, so it reads as a small pool right at the
+// source, not a dry pit.
+const SPRING_SURFACE_LIP = 0.05;
+
+function carveRiver(
+  heights: Float32Array,
+  isRiver: Uint8Array,
+  isSpring: Uint8Array,
+  springLevel: Float32Array,
+  rng: () => number,
+): void {
   // Start from a random high point away from the very edge, then follow
   // steepest descent to carve a naturally flowing valley down to the edge.
   let bestIx = Math.floor(GRID / 2);
@@ -296,14 +335,27 @@ function carveRiver(heights: Float32Array, isRiver: Uint8Array, rng: () => numbe
       }
     }
 
+    // A second/third river call can walk into a stretch an earlier call
+    // already carved — stop and merge there instead of carving all the way
+    // to the edge redundantly, so multi-river maps naturally read as a main
+    // river with tributaries joining it rather than several parallel,
+    // unrelated channels.
     const reachedEdge = nx <= 1 || nx >= GRID - 2 || ny <= 1 || ny >= GRID - 2;
-    if ((nx === ix && ny === iy) || reachedEdge) {
-      if (reachedEdge) path.push([nx, ny]);
+    const reachedExistingRiver = step > 0 && isRiver[idx(ny, nx)] === 1;
+    if ((nx === ix && ny === iy) || reachedEdge || reachedExistingRiver) {
+      if (reachedEdge || reachedExistingRiver) path.push([nx, ny]);
       break;
     }
     ix = nx;
     iy = ny;
   }
+
+  // Snapshot the pre-carve terrain so the channel-depth cut below is always
+  // measured against genuine, un-carved ground, even where the falloff
+  // radius of one path point overlaps the next (path points are only ~1
+  // cell apart, well inside riverWidth) — reading the live, already-mutated
+  // array there would compound and over-deepen the channel with every step.
+  const preCarveHeights = heights.slice();
 
   // Narrow enough that carving only ever touches a cell or two either side of
   // the actual bed (radius 2 grid cells ≈ one tile's width, not the ~8-unit
@@ -313,6 +365,12 @@ function carveRiver(heights: Float32Array, isRiver: Uint8Array, rng: () => numbe
   // a wide swath of surrounding hills, not just cut a believable riverbed.
   const riverWidth = 2.0;
   for (const [px, py] of path) {
+    // Cut relative to this point's own natural (pre-carve) height, not a
+    // flat absolute level — the path is already a steepest-descent walk, so
+    // its natural heights already fall monotonically toward the edge; this
+    // preserves that real downhill gradient in the carved bed instead of
+    // flattening the whole run to one height.
+    const target = preCarveHeights[idx(py, px)] - CHANNEL_DEPTH;
     const radius = Math.ceil(riverWidth);
     for (let dy = -radius; dy <= radius; dy++) {
       for (let dx = -radius; dx <= radius; dx++) {
@@ -322,13 +380,38 @@ function carveRiver(heights: Float32Array, isRiver: Uint8Array, rng: () => numbe
         const dist = Math.sqrt(dx * dx + dy * dy);
         if (dist > riverWidth) continue;
         const falloff = 1 - dist / riverWidth;
-        const target = WATER_LEVEL - 0.3;
         const i = idx(ay, ax);
         // Cubed falloff keeps the carve steep and local instead of a broad,
         // gentle blend into the surrounding terrain.
         heights[i] = THREE.MathUtils.lerp(heights[i], target, falloff * falloff * falloff);
         if (dist < riverWidth * 0.6) isRiver[i] = 1;
       }
+    }
+  }
+
+  // The spring: a small, deeper standing pool right at the source. Marked
+  // in isSpring/springLevel so WaterField keeps it perpetually full on its
+  // own terms — a mountain headwater sits well above global WATER_LEVEL, so
+  // the ordinary "naturally underwater at sea level" self-source rule can
+  // never reach it; without this the entire channel carved above only ever
+  // fills if it happens to dip below global sea level somewhere downstream.
+  const [sourceIx, sourceIy] = path[0];
+  const sourceOriginHeight = preCarveHeights[idx(sourceIy, sourceIx)];
+  const pitRadius = Math.ceil(SPRING_PIT_RADIUS);
+  for (let dy = -pitRadius; dy <= pitRadius; dy++) {
+    for (let dx = -pitRadius; dx <= pitRadius; dx++) {
+      const ax = sourceIx + dx;
+      const ay = sourceIy + dy;
+      if (ax < 0 || ax >= GRID || ay < 0 || ay >= GRID) continue;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist > SPRING_PIT_RADIUS) continue;
+      const falloff = 1 - dist / SPRING_PIT_RADIUS;
+      const i = idx(ay, ax);
+      const target = sourceOriginHeight - SPRING_PIT_DEPTH;
+      heights[i] = THREE.MathUtils.lerp(heights[i], target, falloff * falloff);
+      isSpring[i] = 1;
+      springLevel[i] = sourceOriginHeight - SPRING_SURFACE_LIP;
+      isRiver[i] = 1;
     }
   }
 }

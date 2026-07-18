@@ -30,6 +30,12 @@ function edgeIdxZ(iy: number, ix: number): number {
 // energy arriving from a canal dissipates into "the sea" instead of
 // reflecting forever.
 const SEA_RELAX_RATE = 2.2;
+// Same idea as SEA_RELAX_RATE but for a river/stream spring (see
+// Terrain.isSpring/springLevel) — slower, so a headwater visibly trickles
+// into existence over a couple of seconds at the start of a round rather
+// than popping full like a lake does, matching the "spring welling up"
+// read the fill rate is going for.
+const SPRING_RELAX_RATE = 0.6;
 // How strongly gravity accelerates water across an edge per unit of
 // surface-height difference. Matches the world's own (arcade-scaled)
 // gravity — see game.ts's Rapier world, created with `{ x: 0, y: -16, z: 0
@@ -181,11 +187,19 @@ function createWaterMaterial(): THREE.MeshStandardMaterial {
  * other terrain edit) and a water depth above it, and the same two rules
  * govern all of it:
  *
- *  1. A cell that was *naturally* underwater at world generation (a lake,
- *     river, or the ocean — never a placed road/track/canal, see
- *     originalHeights below) gently relaxes towards being filled up to
- *     global sea level. This is the only self-sourcing rule in the whole
- *     simulation — the one legitimate "infinite reservoir" in the game.
+ *  1. Two flavors of perpetual source, the only self-sourcing rules in the
+ *     whole simulation — the legitimate "infinite reservoirs" in the game:
+ *     a cell that was *naturally* underwater at world generation (a lake,
+ *     river-mouth, or the ocean — never a placed road/track/canal, see
+ *     originalHeights below) gently relaxes towards global sea level; and a
+ *     river/stream *spring* (Terrain.isSpring/springLevel — the small
+ *     headwater pool carved at a carved river's high-elevation source)
+ *     relaxes toward its own local rest level instead, since a mountain
+ *     spring sits well above global sea level and the sea-level rule can
+ *     never reach it. Everything else along a river's actual channel is
+ *     *not* a source — it only ever gets water the same way a canal does,
+ *     via rule 2 below, which is what makes a river actually flow downhill
+ *     from its spring instead of the whole channel just popping full.
  *  2. A real momentum-conserving shallow-water step, edge by edge: each
  *     edge has its own velocity, accelerated by the surface-height (bed +
  *     depth) gradient across it exactly like gravity pulling water
@@ -297,15 +311,31 @@ export class WaterField {
     const heights = this.terrain.heights;
     const depth = this.depth;
 
-    // Pass 1: relax towards being filled — but only for a cell that was
-    // *naturally* underwater at generation (see originalHeights). A dug
-    // cell — road, track, or canal, doesn't matter, and regardless of how
-    // far below sea level it was carved — gets nothing here; whatever
-    // depth it holds came purely from Pass 2 flowing in from a neighbor,
-    // and can flow back out again just as easily. Mutates `depth` directly
-    // (no scratch buffer needed) since each cell's target depends only on
-    // its own bed height, never a neighbor's.
+    // Pass 1: relax towards being filled — but only for a cell that's a
+    // genuine, perpetual water source. A dug cell — road, track, or canal,
+    // doesn't matter, and regardless of how far below sea level it was
+    // carved — gets nothing here; whatever depth it holds came purely from
+    // Pass 2 flowing in from a neighbor, and can flow back out again just
+    // as easily. Mutates `depth` directly (no scratch buffer needed) since
+    // each cell's target depends only on its own bed height, never a
+    // neighbor's. Two kinds of source, checked in order:
+    //  1a. A river/stream spring (see Terrain.isSpring/springLevel) relaxes
+    //      toward its own local rest level — a mountain headwater sits well
+    //      above global WATER_LEVEL, so it needs this independent of sea
+    //      level entirely (checked first since a spring can, in principle,
+    //      end up carved low enough to also satisfy 1b, and it should
+    //      always use its own level/rate, not the sea's).
+    //  1b. A cell that was *naturally* underwater at generation (see
+    //      originalHeights) relaxes toward global sea level — lakes,
+    //      rivers below sea level, and the ocean.
+    const isSpring = this.terrain.isSpring;
+    const springLevel = this.terrain.springLevel;
     for (let i = 0; i < heights.length; i++) {
+      if (isSpring[i]) {
+        const target = Math.max(0, springLevel[i] - heights[i]);
+        depth[i] += (target - depth[i]) * Math.min(1, SPRING_RELAX_RATE * dt);
+        continue;
+      }
       if (this.originalHeights[i] >= WATER_LEVEL) continue;
       const target = Math.max(0, WATER_LEVEL - heights[i]);
       depth[i] += (target - depth[i]) * Math.min(1, SEA_RELAX_RATE * dt);
