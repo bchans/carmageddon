@@ -1,6 +1,6 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
-import { recenterTemplateGeometry, TILE_SIZE } from "./network";
+import { recenterTemplateGeometry } from "./network";
 
 export interface RoadAssets {
   straight: THREE.Object3D;
@@ -13,7 +13,6 @@ export interface RoadAssets {
 
 export interface TrackAssets {
   straight: THREE.Object3D;
-  curve: THREE.Object3D;
 }
 
 export interface TrainAssets {
@@ -69,7 +68,6 @@ export async function loadAssets(): Promise<AssetLibrary> {
     crossroad,
     ramp,
     trackStraight,
-    trackCurve,
     locomotive,
     carriage,
     boat,
@@ -82,45 +80,38 @@ export async function loadAssets(): Promise<AssetLibrary> {
     loadGltf(`${base}assets/road/citybuilder/road-intersection.glb`),
     loadGltf(`${base}assets/road/road-slant-high.glb`),
     loadGltf(`${base}assets/train/railroad-straight.glb`),
-    loadGltf(`${base}assets/train/railroad-corner-large.glb`),
     loadGltf(`${base}assets/train/train-locomotive-a.glb`),
     loadGltf(`${base}assets/train/train-carriage-box.glb`),
     loadGltf(`${base}assets/watercraft/boat-speed-a.glb`),
   ]);
 
-  // The train kit's track pieces are authored with their origin at one
-  // corner (e.g. railroad-straight spans z:[0,4]) rather than centered like
-  // the city-builder road kit's pieces — recenter their geometry once here
-  // so they drop into the same centered-template convention buildKenneyMesh
-  // assumes for every other tile kind.
+  // The train kit's straight track piece is authored with its origin at one
+  // corner (railroad-straight spans z:[0,4]) rather than centered like the
+  // city-builder road kit's pieces — recenter it once here so it drops into
+  // the same centered-template convention buildKenneyMesh assumes for every
+  // other tile kind.
+  //
+  // There is no corresponding curve here: the kit's only curve asset,
+  // railroad-corner-large.glb, was tried and dropped. Measuring its actual
+  // rail vertices (not just its bounding box) showed its two rail tangent
+  // points sit at diagonally *opposite corners* of a ~4.49-unit footprint,
+  // not at the midpoints of two adjacent tile edges — i.e. it's a wide,
+  // multi-tile-radius curve, not a piece sized to connect two perpendicular
+  // neighbors within one TILE_SIZE=4 cell the way this game's grid needs.
+  // No pivot recentering or rotation choice can fix that; two earlier
+  // attempts (swapping the rotation constant) and a third (recentering on
+  // the bbox's tile-aligned min faces) all still left a visible gap/kink at
+  // every curve seam because they were all trying to translate/rotate their
+  // way around a real shape mismatch. tracks.ts now builds curves
+  // procedurally instead (see buildProceduralCurveTrack), the same way
+  // junction pieces already are, with tangent points exactly at edge
+  // midpoints by construction.
   recenterTemplateGeometry(trackStraight, new THREE.Box3().setFromObject(trackStraight).getCenter(new THREE.Vector3()));
-  // The curve piece can't use a plain bbox-center pivot the way the straight
-  // piece does: its "large radius" sweep legitimately bulges past the tile
-  // square by ~0.487 units on the north/east side only (verified straight
-  // from the GLB's raw POSITION accessor: min [-4.0, 0, ~0], max [0.487,
-  // 0.1, 4.487] — two of those four bounds are exact tile-edge numbers, the
-  // other two aren't). Averaging that asymmetric bbox drags the pivot
-  // ~0.24 units off the true tile center on both axes, and because
-  // recenterTemplateGeometry bakes that pivot into the mesh's local vertex
-  // positions *before* the per-placement rotation is applied, the error
-  // rotates along with the piece at every orientation — every placed curve
-  // ends up with its rail geometry shifted toward the corner it's NOT
-  // connecting to, gapping away from the two edges (its actual N/E
-  // connections) it's supposed to meet flush. This is what actually reads
-  // as "the curve faces the wrong way", independent of and undiscovered by
-  // the two earlier commits that only debated the rotation constant. Anchor
-  // the pivot on the two genuinely tile-aligned min faces instead, so it
-  // lands on the true tile center regardless of the bulge.
-  const curveBox = new THREE.Box3().setFromObject(trackCurve);
-  recenterTemplateGeometry(
-    trackCurve,
-    new THREE.Vector3(curveBox.min.x + TILE_SIZE / 2, curveBox.getCenter(new THREE.Vector3()).y, curveBox.min.z + TILE_SIZE / 2),
-  );
 
   return {
     carScene,
     road: { straight, straightVariant, curve, tJunction, crossroad, ramp },
-    track: { straight: trackStraight, curve: trackCurve },
+    track: { straight: trackStraight },
     train: { locomotive, carriage },
     ship: { boat },
   };

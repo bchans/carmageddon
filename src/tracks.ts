@@ -3,16 +3,7 @@ import type RAPIER from "@dimforge/rapier3d-compat";
 import type { Rapier } from "./physics";
 import type { Terrain } from "./terrain";
 import type { TrackAssets } from "./assets";
-import {
-  TileNetwork,
-  TILE_SIZE,
-  DIRS,
-  cellCenter,
-  type Cell,
-  buildKenneyMesh,
-  curveRotationSteps,
-  buildArchBridgeMesh,
-} from "./network";
+import { TileNetwork, TILE_SIZE, DIRS, cellCenter, type Cell, buildKenneyMesh, buildArchBridgeMesh } from "./network";
 
 export const TrackKind = {
   Standard: "standard",
@@ -36,49 +27,44 @@ const TRACK_BRIDGE_PIER_COLOR = 0x8a3a2e; // brick red
 // sandbox, but the user supplied the kit directly) is already authored at
 // tile scale (railroad-straight.glb spans exactly 4 units, matching
 // TILE_SIZE) and with its origin at one corner rather than centered, unlike
-// the city-builder road kit — assets.ts recenters the straight/curve
-// templates once at load time so they drop into the same buildKenneyMesh
-// pipeline roads use. No color retint is wanted (the kit's own silver
-// rail / brown tie colors are already right), so straight/curve pass an
-// identity tint.
+// the city-builder road kit — assets.ts recenters it once at load time so it
+// drops into the same buildKenneyMesh pipeline roads use. No color retint is
+// wanted (the kit's own silver rail / brown tie colors are already right),
+// so it passes an identity tint.
 const IDENTITY_TINT_TARGET = 0xffffff;
 const IDENTITY_SWATCH: number[] = [1, 1, 1];
-
-// The corner-large template natively (rotationY = 0) connects dirs {0, 1}
-// (N, E) — measured directly, not guessed: after the exact same recenter
-// buildKenneyMesh/assets.ts apply, every rail vertex in the loaded mesh was
-// sampled in world space at each of the 4 rotation steps and matched against
-// the true tile-edge-midpoint distance for N/E/S/W. At rotationY=0 the
-// closest two edges by a wide margin (~0.38 vs ~1.24 units) are N and E; the
-// other three rotation steps each shift that pair by exactly one DIRS step,
-// confirming both this constant and curveRotationSteps' formula are
-// self-consistent. (A previous fix here changed this to {3, 0} by reasoning
-// from the raw GLB's pre-recenter bounding-box *corners*, which don't
-// actually mark where the rail's two tangent legs terminate for a wide
-// sweeping arc — that was the regression the {0, 1} value below corrects.)
-const TRACK_CORNER_NATIVE_DIRS: [number, number] = [0, 1];
 
 function buildStraightTrack(axisIsZ: boolean, pitch: number, trackAssets: TrackAssets): THREE.Object3D {
   return buildKenneyMesh(trackAssets.straight, axisIsZ ? 0 : Math.PI / 2, IDENTITY_TINT_TARGET, IDENTITY_SWATCH, pitch, 1);
 }
 
-function buildCurveTrack(dirs: [number, number], trackAssets: TrackAssets): THREE.Object3D {
-  const steps = curveRotationSteps(dirs, TRACK_CORNER_NATIVE_DIRS);
-  return buildKenneyMesh(trackAssets.curve, steps * (Math.PI / 2), IDENTITY_TINT_TARGET, IDENTITY_SWATCH, 0, 1);
-}
-
-// --- Procedural fallback for 3-/4-way junctions --------------------------
+// --- Procedural rail geometry (curves and 3-/4-way junctions) ------------
 //
-// The train kit has no T-junction/crossing piece (real rail networks rarely
-// have a literal 4-way rail crossing either), so a junction tile — otherwise
-// rare — falls back to simple procedural rail arms instead of a missing
-// asset.
-const RAIL_GAUGE = 0.16;
-const RAIL_WIDTH = 0.035;
+// The train kit's only curve piece (railroad-corner-large.glb) turned out to
+// be a wide, multi-tile-radius curve — its two rail tangent points sit at
+// diagonally opposite corners of a ~4.49-unit footprint, not at the
+// midpoints of two adjacent tile edges, so no rotation or recenter pivot
+// could make it connect flush to a neighboring straight piece within one
+// TILE_SIZE=4 cell (see assets.ts for how that was actually measured, not
+// guessed). Curves are built procedurally instead, the same way junctions
+// already were — an arc of rail/tie segments running from one connected
+// edge's midpoint to the other's, exactly, by construction.
+// Matches the Kenney straight piece's own rail spacing exactly — measured
+// directly off its rendered rail vertices at a tile seam (centerlines at
+// +-0.3, each rail 0.1 wide) — rather than an earlier, narrower guess that
+// only the procedural junction pieces used and nothing cross-checked against
+// the actual asset, so a junction never actually lined up with a straight
+// either.
+const RAIL_GAUGE = 0.3;
+const RAIL_WIDTH = 0.1;
 const RAIL_HEIGHT = 0.05;
 const BED_HEIGHT = 0.03;
 const TIE_COUNT = 3;
-const TIE_WIDTH = 0.42;
+// Wide enough to reach a bit past both rails' outer edges (rail centerlines
+// at +-RAIL_GAUGE, +-RAIL_WIDTH/2 wide each) rather than stopping short of
+// them — matters more now that RAIL_GAUGE matches the actual (wider) Kenney
+// straight piece instead of the old, narrower procedural-only guess.
+const TIE_WIDTH = 0.9;
 const TIE_DEPTH = 0.075;
 const TIE_HEIGHT = 0.03;
 
@@ -115,6 +101,75 @@ function buildRailArm(dir: number): THREE.Group {
     arm.add(rail);
   }
   return arm;
+}
+
+// How many straight sub-segments approximate the arc — enough for a smooth
+// curve at this tile scale without needing a real curved-geometry pipeline
+// (ExtrudeGeometry/TubeGeometry) just for two thin rail lines.
+const CURVE_ARC_SEGMENTS = 10;
+const CURVE_TIE_COUNT = 7;
+
+/**
+ * A curve connecting two perpendicular directions `dirs`, built as an arc of
+ * straight rail/tie segments from one connected edge's midpoint to the
+ * other's — exactly, by construction, rather than relying on a pre-modeled
+ * asset's own (possibly mismatched) geometry.
+ *
+ * The arc's center is the tile corner diagonally between the two connected
+ * edges, at radius TILE_SIZE/2: for perpendicular directions A and B, that
+ * corner is always exactly TILE_SIZE/2 from both edge midpoints (Pythagoras
+ * isn't even needed — it falls straight out of DIRS being unit vectors
+ * along the axes), so a circle of that radius centered there passes through
+ * both tangent points and sweeps through the tile's interior between them,
+ * the same shape a real quarter-circle curve piece should have.
+ */
+function buildCurveTrack(dirs: [number, number]): THREE.Object3D {
+  const half = TILE_SIZE / 2;
+  const [dA, dB] = [DIRS[dirs[0]], DIRS[dirs[1]]];
+  const centerX = (dA.dc + dB.dc) * half;
+  const centerZ = (dA.dr + dB.dr) * half;
+  const angleA = Math.atan2(dA.dr * half - centerZ, dA.dc * half - centerX);
+  const angleB = Math.atan2(dB.dr * half - centerZ, dB.dc * half - centerX);
+  let delta = angleB - angleA;
+  while (delta > Math.PI) delta -= Math.PI * 2;
+  while (delta < -Math.PI) delta += Math.PI * 2;
+
+  const group = new THREE.Group();
+
+  for (const offset of [-RAIL_GAUGE, RAIL_GAUGE]) {
+    const r = half + offset;
+    for (let i = 0; i < CURVE_ARC_SEGMENTS; i++) {
+      const ang0 = angleA + (delta * i) / CURVE_ARC_SEGMENTS;
+      const ang1 = angleA + (delta * (i + 1)) / CURVE_ARC_SEGMENTS;
+      const x0 = centerX + Math.cos(ang0) * r;
+      const z0 = centerZ + Math.sin(ang0) * r;
+      const x1 = centerX + Math.cos(ang1) * r;
+      const z1 = centerZ + Math.sin(ang1) * r;
+      const segLen = Math.hypot(x1 - x0, z1 - z0);
+      const segAngle = Math.atan2(z1 - z0, x1 - x0);
+      // Slight overlap between consecutive segments so the polyline
+      // approximation of the arc doesn't show hairline gaps at the joins.
+      const rail = new THREE.Mesh(new THREE.BoxGeometry(segLen * 1.15, RAIL_HEIGHT, RAIL_WIDTH), railMaterial);
+      rail.position.set((x0 + x1) / 2, RAIL_HEIGHT / 2 + BED_HEIGHT, (z0 + z1) / 2);
+      rail.rotation.y = -segAngle;
+      rail.castShadow = true;
+      group.add(rail);
+    }
+  }
+
+  for (let i = 0; i <= CURVE_TIE_COUNT; i++) {
+    const ang = angleA + (delta * i) / CURVE_TIE_COUNT;
+    const tx = centerX + Math.cos(ang) * half;
+    const tz = centerZ + Math.sin(ang) * half;
+    const tie = new THREE.Mesh(new THREE.BoxGeometry(TIE_WIDTH, TIE_HEIGHT, TIE_DEPTH), tieMaterial);
+    tie.position.set(tx, TIE_HEIGHT / 2 + BED_HEIGHT, tz);
+    tie.rotation.y = -ang; // radial direction — perpendicular to the rails at this point, same as a straight tie
+    tie.castShadow = true;
+    tie.receiveShadow = true;
+    group.add(tie);
+  }
+
+  return group;
 }
 
 function buildJunctionTile(dirs: number[]): THREE.Object3D {
@@ -155,7 +210,7 @@ export class TrackSystem extends TileNetwork<TrackKind> {
       const [a, b] = dirs;
       const opposite = (a + 2) % 4 === b;
       if (opposite) return buildStraightTrack(a % 2 === 0, pitch, this.trackAssets);
-      return buildCurveTrack([a, b] as [number, number], this.trackAssets);
+      return buildCurveTrack([a, b] as [number, number]);
     }
     if (dirs.length === 1) return buildStraightTrack(dirs[0] % 2 === 0, pitch, this.trackAssets);
     return buildStraightTrack(true, pitch, this.trackAssets); // isolated tile: default N/S stub
